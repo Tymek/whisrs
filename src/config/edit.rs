@@ -386,13 +386,10 @@ fn edit_vocabulary_and_prompt(config: &mut Config, use_vocab_file: bool) -> Resu
         );
     }
 
-    let current = if config.general.vocabulary.is_empty() {
-        "(empty)".to_string()
-    } else {
-        config.general.vocabulary.join(", ")
-    };
-    println!("  Current vocabulary: {current}");
-
+    // No "Current vocabulary:" line: the prompt below seeds the editable
+    // buffer with the same list, and printing it twice doubled the wrapped
+    // rows on screen — enough to push this section's header out of view for a
+    // list of any size.
     let input: String = Input::new()
         .with_prompt("Comma-separated vocabulary (leave blank to clear)")
         .with_initial_text(config.general.vocabulary.join(", "))
@@ -401,8 +398,6 @@ fn edit_vocabulary_and_prompt(config: &mut Config, use_vocab_file: bool) -> Resu
         .context("failed to read vocabulary")?;
     config.general.vocabulary = parse_csv_list(&input);
 
-    let current_prompt = config.general.prompt.as_deref().unwrap_or("(none)");
-    println!("  Current prompt: {current_prompt}");
     let prompt: String = Input::new()
         .with_prompt("Free-form prompt (style/register hints; leave blank to clear)")
         .with_initial_text(config.general.prompt.clone().unwrap_or_default())
