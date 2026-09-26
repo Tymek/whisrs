@@ -11,6 +11,18 @@ use crate::factory::resolve_tts_api_key;
 use crate::notify::send_notification;
 use crate::selection::capture_selection;
 
+/// Bounded wait for the first TTS audio chunk before failing the read-aloud.
+///
+/// Streaming time-to-first-audio is on the order of ~100 ms, so this is
+/// generous; it only fires when the TTS server is stalled and would otherwise
+/// leave the daemon stuck in `Synthesizing` forever waiting for a chunk that
+/// never arrives (e.g. a server deadlocked on its own generation lock).
+const FIRST_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to wait for the producer task to unwind after signalling `stop` on
+/// a first-chunk timeout before giving up on awaiting it.
+const PRODUCER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Read the selected text aloud via TTS.
 ///
 /// FSM-authoritative: read-aloud has its own `Synthesizing`/`Speaking` states,
@@ -139,7 +151,10 @@ pub(crate) async fn handle_speak(
             } => Ok(()),
         }
     });
-    let first_chunk = receiver.recv().await;
+    // (e2) Wait a bounded time for the first chunk. A stalled TTS server that
+    // never opens its response would otherwise hang the daemon in `Synthesizing`
+    // indefinitely; timeout and surface an error instead.
+    let first_chunk = tokio::time::timeout(FIRST_CHUNK_TIMEOUT, receiver.recv()).await;
 
     // (f) Re-lock to decide whether to play.
     let final_state = {
@@ -155,14 +170,25 @@ pub(crate) async fn handle_speak(
         }
 
         let first_chunk = match first_chunk {
-            Some(bytes) => bytes,
-            None => {
-                // The producer has closed the channel: get its HTTP/body error.
+            // A chunk arrived in time.
+            Ok(Some(bytes)) => bytes,
+            // Producer closed without a first chunk (HTTP/body error) or the
+            // server stalled past the first-chunk timeout. Either way: cancel
+            // the producer, then finalize the FSM back to Idle with an error.
+            outcome => {
                 drop(ds);
-                let message = match producer.await {
-                    Ok(Err(e)) => e.to_string(),
-                    Ok(Ok(())) => "TTS returned an empty response".to_string(),
-                    Err(e) => format!("TTS task failed: {e}"),
+                let message = match outcome {
+                    Ok(None) => match producer.await {
+                        Ok(Err(e)) => e.to_string(),
+                        Ok(Ok(())) => "TTS returned an empty response".to_string(),
+                        Err(e) => format!("TTS task failed: {e}"),
+                    },
+                    Err(_) => {
+                        stop.store(true, Ordering::Release);
+                        let _ = tokio::time::timeout(PRODUCER_SHUTDOWN_GRACE, producer).await;
+                        "TTS timed out before producing audio".to_string()
+                    }
+                    Ok(Some(_)) => unreachable!(),
                 };
                 let mut ds = daemon_state.lock().await;
                 if ds.state_machine.state() != State::Synthesizing
