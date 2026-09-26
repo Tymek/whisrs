@@ -170,6 +170,9 @@ pub enum StreamChunk {
     Error(String),
 }
 
+/// Error for a body reader that hung up without an end marker or `stop`.
+const STREAM_ENDED_UNEXPECTEDLY: &str = "TTS audio stream ended unexpectedly";
+
 /// How long [`play_wav_stream`] waits on the channel before re-checking `stop`.
 const STREAM_POLL: Duration = Duration::from_millis(20);
 /// Give up on a stream that delivers no bytes for this long before its end.
@@ -188,10 +191,13 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// to the end of the body and played through [`decode_wav`], as [`play_wav`]
 /// does.
 ///
-/// Returns `Ok` on normal completion, on `stop`, and when the sender is
-/// dropped without [`StreamChunk::End`] (treated as the end of the body).
-/// Returns `Err` on [`StreamChunk::Error`] (queued audio is cut off), on a
-/// stream that stalls for 30 s, and on an undecodable buffered body.
+/// Returns `Ok` on normal completion and on `stop` (including a sender that
+/// hangs up because `stop` was set; nothing further is played and
+/// `first_audio` is not fired). Returns `Err` on [`StreamChunk::Error`]
+/// (queued audio is cut off; the message is passed through as is), on a
+/// sender dropped without [`StreamChunk::End`] while not stopped (the reader
+/// died), on a stream that stalls for 30 s, and on an undecodable buffered
+/// body.
 ///
 /// Intended for a blocking task (`spawn_blocking`).
 pub fn play_wav_stream(
@@ -215,6 +221,17 @@ pub fn play_wav_stream(
     let mut decoded: Vec<f32> = Vec::new();
     let mut body_bytes: u64 = 0;
     let mut last_chunk = Instant::now();
+
+    // A hang-up is an interruption if the reader quit because `stop` was set,
+    // and a failure otherwise (the reader sends `End`/`Error` on every other
+    // exit, so a bare disconnect means it died, e.g. panicked).
+    let disconnect_outcome = |stop: &AtomicBool| {
+        if stop.load(Ordering::Acquire) {
+            Outcome::Stopped
+        } else {
+            Outcome::Failed(STREAM_ENDED_UNEXPECTEDLY.to_string())
+        }
+    };
 
     let outcome = loop {
         if stop.load(Ordering::Acquire) {
@@ -252,13 +269,13 @@ pub fn play_wav_stream(
                 }
                 if let Some(p) = pipeline.as_mut() {
                     p.feed(&decoded, &mut first_audio);
+                    // Feeding waits while the queue is full; that is not a
+                    // stalled stream.
+                    last_chunk = Instant::now();
                 }
             }
             Ok(StreamChunk::End) => break Outcome::Ended,
-            Err(RecvTimeoutError::Disconnected) => {
-                debug!("TTS stream sender dropped without an end marker; treating as end");
-                break Outcome::Ended;
-            }
+            Err(RecvTimeoutError::Disconnected) => break disconnect_outcome(&stop),
             Ok(StreamChunk::Error(msg)) => break Outcome::Failed(msg),
             Err(RecvTimeoutError::Timeout) => {
                 if last_chunk.elapsed() > STREAM_IDLE_TIMEOUT {
@@ -284,9 +301,7 @@ pub fn play_wav_stream(
         Outcome::Failed(msg) => {
             drop(pipeline);
             reset_level(&level_tx);
-            Err(WhisrsError::Audio(format!(
-                "TTS audio stream failed: {msg}"
-            )))
+            Err(WhisrsError::Audio(msg))
         }
         Outcome::Stalled => {
             drop(pipeline);
@@ -302,6 +317,12 @@ pub fn play_wav_stream(
                 Some(buffered) => {
                     drop(pipeline);
                     let decoded = decode_wav(&buffered)?;
+                    // Stopped while the body finished: don't open the device.
+                    if stop.load(Ordering::Acquire) {
+                        debug!("TTS playback interrupted");
+                        reset_level(&level_tx);
+                        return Ok(());
+                    }
                     play_decoded(decoded, stop, level_tx, first_audio)
                 }
                 None => {
@@ -836,10 +857,21 @@ fn open_output(
     Ok((device, config))
 }
 
+/// Device audio held in the sample queue. The queue is allocated once at this
+/// size and never grows: the feeder waits for room instead, so neither side
+/// ever allocates while holding the lock.
+const QUEUE_SECONDS: f64 = 10.0;
+/// Device audio copied per lock acquisition, so the feeder only ever holds the
+/// lock the audio callback `try_lock`s for a few microseconds.
+const ENQUEUE_BATCH_SECONDS: f64 = 0.005;
+
 /// Resampler plus a cpal stream fed from a shared sample queue.
 struct StreamPipeline {
     resampler: StreamResampler,
     queue: Arc<Mutex<VecDeque<f32>>>,
+    /// Samples copied into `queue` per lock acquisition.
+    batch: usize,
+    stop: Arc<AtomicBool>,
     /// Device samples per second (rate * channels), for drain bounds.
     samples_per_sec: f64,
     /// Scratch buffer for resampler output.
@@ -858,8 +890,7 @@ impl StreamPipeline {
         let (device, config) = open_output(format.sample_rate, format.channels)?;
         let samples_per_sec = config.sample_rate.0 as f64 * config.channels as f64;
         let queue: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
-            // ~10 s up front so typical clips never reallocate under the lock.
-            (samples_per_sec * 10.0) as usize,
+            (samples_per_sec * QUEUE_SECONDS) as usize,
         )));
 
         let queue_cb = Arc::clone(&queue);
@@ -908,6 +939,8 @@ impl StreamPipeline {
                 config.sample_rate.0,
             ),
             queue,
+            batch: ((samples_per_sec * ENQUEUE_BATCH_SECONDS) as usize).max(1),
+            stop: Arc::clone(stop),
             samples_per_sec,
             scratch: Vec::new(),
             _stream: stream,
@@ -933,16 +966,19 @@ impl StreamPipeline {
     }
 
     fn enqueue(&mut self, first_audio: &mut Option<tokio::sync::oneshot::Sender<()>>) {
-        if self.scratch.is_empty() {
-            return;
-        }
-        if let Ok(mut q) = self.queue.lock() {
-            q.extend(self.scratch.iter().copied());
-        }
-        if let Some(tx) = first_audio.take() {
-            debug!("TTS first audio queued ({} samples)", self.scratch.len());
-            let _ = tx.send(());
-        }
+        let mut first = || {
+            if let Some(tx) = first_audio.take() {
+                debug!("TTS first audio queued");
+                let _ = tx.send(());
+            }
+        };
+        enqueue_bounded(
+            &self.queue,
+            &self.scratch,
+            self.batch,
+            &self.stop,
+            &mut first,
+        );
     }
 
     fn queued(&self) -> usize {
@@ -972,6 +1008,49 @@ impl StreamPipeline {
         }
         // Let the device play out its last buffer.
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Append `samples` to the fixed-capacity `queue` without ever growing it,
+/// copying at most `batch` samples per lock acquisition and sleeping with the
+/// lock released while the queue is full. `on_first_push` runs once, after
+/// the first samples land. Returns early (dropping the rest) when `stop` is set or the
+/// lock is poisoned.
+///
+/// This keeps the lock the audio callback `try_lock`s short, bounded and
+/// allocation-free; a failed `try_lock` there costs a buffer of silence.
+fn enqueue_bounded(
+    queue: &Mutex<VecDeque<f32>>,
+    samples: &[f32],
+    batch: usize,
+    stop: &AtomicBool,
+    on_first_push: &mut dyn FnMut(),
+) {
+    let mut rest = samples;
+    let mut pushed_any = false;
+    while !rest.is_empty() {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let pushed = {
+            let Ok(mut q) = queue.lock() else {
+                return;
+            };
+            let room = q.capacity() - q.len();
+            let n = room.min(batch).min(rest.len());
+            q.extend(rest[..n].iter().copied());
+            n
+        };
+        if pushed == 0 {
+            // Full: seconds of audio are queued, so a short wait is harmless.
+            std::thread::sleep(STREAM_POLL);
+            continue;
+        }
+        if !pushed_any {
+            pushed_any = true;
+            on_first_push();
+        }
+        rest = &rest[pushed..];
     }
 }
 
@@ -1689,5 +1768,109 @@ mod tests {
         rs.push(&[], &mut out);
         rs.finish(&mut out);
         assert!(out.is_empty());
+    }
+
+    // --- bounded enqueue --------------------------------------------------
+
+    #[test]
+    fn enqueue_bounded_never_grows_the_queue_and_keeps_order() {
+        let queue = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(64)));
+        let cap = queue.lock().unwrap().capacity();
+        let stop = AtomicBool::new(false);
+        let samples: Vec<f32> = (0..1000).map(|i| i as f32).collect();
+
+        // A consumer standing in for the audio callback.
+        let consumer = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                while got.len() < 1000 {
+                    if let Ok(mut q) = queue.try_lock() {
+                        assert_eq!(q.capacity(), cap, "queue reallocated");
+                        let n = q.len().min(40);
+                        got.extend(q.drain(..n));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                got
+            })
+        };
+        let mut firsts = 0;
+        enqueue_bounded(&queue, &samples, 16, &stop, &mut || firsts += 1);
+        assert_eq!(consumer.join().unwrap(), samples);
+        assert_eq!(firsts, 1);
+        assert_eq!(queue.lock().unwrap().capacity(), cap);
+    }
+
+    #[test]
+    fn enqueue_bounded_returns_on_stop_while_full() {
+        let queue = Mutex::new(VecDeque::<f32>::with_capacity(8));
+        let cap = queue.lock().unwrap().capacity();
+        let stop = AtomicBool::new(false);
+        let mut firsts = 0;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(60));
+                stop.store(true, Ordering::Release);
+            });
+            // Nothing drains the queue, so this must be ended by `stop`.
+            enqueue_bounded(&queue, &vec![0.5; cap * 4], 4, &stop, &mut || firsts += 1);
+        });
+        assert_eq!(queue.lock().unwrap().len(), cap);
+        assert_eq!(firsts, 1);
+    }
+
+    #[test]
+    fn enqueue_bounded_does_nothing_once_stopped() {
+        let queue = Mutex::new(VecDeque::<f32>::with_capacity(8));
+        let stop = AtomicBool::new(true);
+        let mut firsts = 0;
+        enqueue_bounded(&queue, &[0.1; 4], 4, &stop, &mut || firsts += 1);
+        assert!(queue.lock().unwrap().is_empty());
+        assert_eq!(firsts, 0);
+    }
+
+    // --- stream stop / disconnect classification (no device opened) -------
+
+    fn run_stream(chunks: Vec<StreamChunk>, stop: bool) -> (Result<(), WhisrsError>, bool) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for c in chunks {
+            tx.send(c).unwrap();
+        }
+        drop(tx);
+        let (first_tx, mut first_rx) = tokio::sync::oneshot::channel();
+        let result = play_wav_stream(rx, Arc::new(AtomicBool::new(stop)), None, first_tx);
+        let fired = first_rx.try_recv().is_ok();
+        (result, fired)
+    }
+
+    #[test]
+    fn stream_stopped_with_buffered_body_plays_nothing() {
+        // A non-WAV body would take the buffered fallback on `End`.
+        let (result, fired) = run_stream(vec![StreamChunk::Data(b"not a wav".to_vec())], true);
+        assert!(result.is_ok());
+        assert!(!fired, "first_audio must not fire on stop");
+    }
+
+    #[test]
+    fn stream_hangup_without_end_or_stop_is_an_error() {
+        let (result, fired) = run_stream(vec![StreamChunk::Data(b"not a wav".to_vec())], false);
+        match result {
+            Err(WhisrsError::Audio(msg)) => assert_eq!(msg, STREAM_ENDED_UNEXPECTEDLY),
+            other => panic!("expected an unexpected-end error, got {other:?}"),
+        }
+        assert!(!fired);
+    }
+
+    #[test]
+    fn stream_error_message_passes_through_unwrapped() {
+        let (result, _) = run_stream(
+            vec![StreamChunk::Error("TTS read body failed: reset".into())],
+            false,
+        );
+        match result {
+            Err(WhisrsError::Audio(msg)) => assert_eq!(msg, "TTS read body failed: reset"),
+            other => panic!("expected the body error, got {other:?}"),
+        }
     }
 }

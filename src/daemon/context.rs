@@ -64,10 +64,13 @@ pub(crate) struct DaemonState {
     pub(crate) llm_instruction_overrides: std::collections::HashMap<String, String>,
     /// Stop flag for in-progress TTS playback (read-selection-aloud).
     ///
-    /// Set when a `Speak` synthesis succeeds and playback begins; cleared when
-    /// playback finishes. `Cancel` and a repeat `Speak` both flip it to `true`
-    /// to interrupt playback. Read-aloud runs independently of the recording
-    /// state machine, so there is no dedicated `State` variant.
+    /// Installed when a `Speak` session enters `Synthesizing` (before the
+    /// synthesis request is sent), so it also interrupts the request, the
+    /// body reader and playback; cleared when the session finishes. `Cancel`
+    /// and a repeat `Speak` both flip it to `true`. Its identity
+    /// (`Arc::ptr_eq`) marks which session owns the read-aloud state; whether
+    /// read-aloud is active is decided by the `Synthesizing`/`Speaking` states,
+    /// not by this flag.
     pub(crate) tts_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 

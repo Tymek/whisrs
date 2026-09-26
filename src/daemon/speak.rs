@@ -137,12 +137,21 @@ pub(crate) async fn handle_speak(
     let started_at = Instant::now();
 
     // (e) Start synthesis (no lock held). This returns once the response
-    // headers arrive; the audio body is streamed afterwards.
-    let synth_result = backend.synthesize(&selected_text).await;
+    // headers arrive; the audio body is streamed afterwards. It is raced
+    // against `stop`, so a second press / cancel while a slow server holds
+    // the headers drops the request instead of leaving it running.
+    let synth_result = until_stopped(backend.synthesize(&selected_text), &stop).await;
 
     // (f) Re-lock to decide whether to play.
     let audio = {
         let mut ds = daemon_state.lock().await;
+
+        let Some(synth_result) = synth_result else {
+            info!("speak: synthesis cancelled before the response arrived");
+            return Response::Ok {
+                state: ds.state_machine.state(),
+            };
+        };
 
         // A second press / cancel during synthesis stopped us — state is no
         // longer ours. Don't play; report the current state. Dropping the
@@ -290,18 +299,47 @@ fn finish_session(ds: &mut DaemonState, context: &DaemonContext) {
 }
 
 /// Collapse the playback task's outcome into an error message, if any.
+///
+/// The message is the error's own text without the `WhisrsError` category
+/// prefix, since the caller already frames it ("Read-aloud failed: ...",
+/// "TTS playback failed: ...").
 fn playback_failure(
     result: Result<Result<(), whisrs::WhisrsError>, tokio::task::JoinError>,
 ) -> Option<String> {
     match result {
         Ok(Ok(())) => None,
-        Ok(Err(e)) => Some(e.to_string()),
+        Ok(Err(e)) => Some(inner_message(e)),
         Err(e) => Some(format!("playback task panicked: {e}")),
     }
 }
 
-/// How often the chunk reader re-checks `stop` while waiting on the network.
+/// The message carried by an audio / transcription error, without the
+/// "audio error: " / "transcription error: " prefix its `Display` adds.
+fn inner_message(e: whisrs::WhisrsError) -> String {
+    match e {
+        whisrs::WhisrsError::Audio(m) | whisrs::WhisrsError::Transcription(m) => m,
+        other => other.to_string(),
+    }
+}
+
+/// How often `stop` is re-checked while waiting on the network.
 const STOP_POLL: Duration = Duration::from_millis(50);
+
+/// Resolve once `stop` is set, polling every [`STOP_POLL`].
+async fn stopped(stop: &AtomicBool) {
+    while !stop.load(Ordering::Acquire) {
+        tokio::time::sleep(STOP_POLL).await;
+    }
+}
+
+/// Run `fut` until it completes or `stop` is set. On stop the future is
+/// dropped (closing any connection it holds) and `None` is returned.
+async fn until_stopped<F: std::future::Future>(fut: F, stop: &AtomicBool) -> Option<F::Output> {
+    tokio::select! {
+        out = fut => Some(out),
+        _ = stopped(stop) => None,
+    }
+}
 
 /// Forward the TTS body to the player until it ends, fails, the player hangs
 /// up, or `stop` is set. `stop` is also polled while a read is pending, so a
@@ -311,23 +349,93 @@ async fn forward_chunks(
     tx: std::sync::mpsc::Sender<StreamChunk>,
     stop: Arc<AtomicBool>,
 ) {
-    let stopped = || async {
-        while !stop.load(Ordering::Acquire) {
-            tokio::time::sleep(STOP_POLL).await;
-        }
-    };
     loop {
-        let next = tokio::select! {
-            next = audio.next_chunk() => next,
-            _ = stopped() => return,
+        // On stop, return without an end marker: the player checks `stop`
+        // when the channel disconnects and reports an interruption.
+        let Some(next) = until_stopped(audio.next_chunk(), &stop).await else {
+            return;
         };
         let (chunk, last) = match next {
             Ok(Some(data)) => (StreamChunk::Data(data), false),
             Ok(None) => (StreamChunk::End, true),
-            Err(e) => (StreamChunk::Error(e.to_string()), true),
+            Err(e) => (StreamChunk::Error(inner_message(e)), true),
         };
         if tx.send(chunk).is_err() || last {
             return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sets its flag when dropped, to observe that a raced future is dropped.
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn until_stopped_drops_a_pending_future_on_stop() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&dropped));
+        // Stands in for a synth request whose server never sends headers.
+        let pending = async move {
+            let _guard = guard;
+            std::future::pending::<()>().await
+        };
+        let setter = {
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                stop.store(true, Ordering::Release);
+            })
+        };
+        let started = tokio::time::Instant::now();
+        assert!(until_stopped(pending, &stop).await.is_none());
+        assert!(dropped.load(Ordering::Acquire), "future must be dropped");
+        assert!(started.elapsed() <= Duration::from_millis(120) + STOP_POLL);
+        setter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn until_stopped_returns_the_output_when_not_stopped() {
+        let stop = AtomicBool::new(false);
+        assert_eq!(until_stopped(async { 7 }, &stop).await, Some(7));
+    }
+
+    #[test]
+    fn failure_messages_drop_the_error_category_prefix() {
+        let e = whisrs::WhisrsError::Transcription("TTS read body failed: reset".into());
+        assert_eq!(inner_message(e), "TTS read body failed: reset");
+        let e = whisrs::WhisrsError::Audio("no default audio output device".into());
+        assert_eq!(
+            playback_failure(Ok(Err(e))).as_deref(),
+            Some("no default audio output device")
+        );
+        assert_eq!(playback_failure(Ok(Ok(()))), None);
+    }
+
+    #[tokio::test]
+    async fn body_error_reaches_the_player_without_nested_prefixes() {
+        struct FailingBody;
+        #[async_trait::async_trait]
+        impl TtsAudioStream for FailingBody {
+            async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, whisrs::WhisrsError> {
+                Err(whisrs::WhisrsError::Transcription(
+                    "TTS read body failed: reset".into(),
+                ))
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        forward_chunks(Box::new(FailingBody), tx, Arc::new(AtomicBool::new(false))).await;
+        match rx.recv().unwrap() {
+            StreamChunk::Error(msg) => assert_eq!(msg, "TTS read body failed: reset"),
+            other => panic!("expected an error chunk, got {other:?}"),
         }
     }
 }
