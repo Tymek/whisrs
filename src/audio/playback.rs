@@ -177,6 +177,10 @@ const STREAM_ENDED_UNEXPECTEDLY: &str = "TTS audio stream ended unexpectedly";
 const STREAM_POLL: Duration = Duration::from_millis(20);
 /// Give up on a stream that delivers no bytes for this long before its end.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Give up when the sample queue stays full this long: the output device has
+/// stopped consuming samples (sink disconnected, ALSA error reported only to
+/// cpal's error callback).
+const DEVICE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Play a WAV response body as it arrives, blocking until playback finishes,
 /// `stop` is set, or the stream fails.
@@ -196,8 +200,9 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `first_audio` is not fired). Returns `Err` on [`StreamChunk::Error`]
 /// (queued audio is cut off; the message is passed through as is), on a
 /// sender dropped without [`StreamChunk::End`] while not stopped (the reader
-/// died), on a stream that stalls for 30 s, and on an undecodable buffered
-/// body.
+/// died), on a stream that stalls for 30 s, on an output device that stops
+/// consuming samples for [`DEVICE_STALL_TIMEOUT`] while the queue is full, and
+/// on an undecodable buffered body.
 ///
 /// Intended for a blocking task (`spawn_blocking`).
 pub fn play_wav_stream(
@@ -213,6 +218,7 @@ pub fn play_wav_stream(
         Stopped,
         Failed(String),
         Stalled,
+        Device(WhisrsError),
     }
 
     let mut first_audio = Some(first_audio);
@@ -268,7 +274,9 @@ pub fn play_wav_stream(
                     PushEvent::None => {}
                 }
                 if let Some(p) = pipeline.as_mut() {
-                    p.feed(&decoded, &mut first_audio);
+                    if let Err(e) = p.feed(&decoded, &mut first_audio) {
+                        break Outcome::Device(e);
+                    }
                     // Feeding waits while the queue is full; that is not a
                     // stalled stream.
                     last_chunk = Instant::now();
@@ -311,32 +319,54 @@ pub fn play_wav_stream(
                 STREAM_IDLE_TIMEOUT.as_secs()
             )))
         }
+        Outcome::Device(e) => {
+            drop(pipeline);
+            reset_level(&level_tx);
+            Err(e)
+        }
         Outcome::Ended => {
             debug!("TTS stream body ended after {body_bytes} bytes");
             match decoder.finish() {
                 Some(buffered) => {
                     drop(pipeline);
-                    let decoded = decode_wav(&buffered)?;
-                    // Stopped while the body finished: don't open the device.
-                    if stop.load(Ordering::Acquire) {
-                        debug!("TTS playback interrupted");
-                        reset_level(&level_tx);
-                        return Ok(());
-                    }
-                    play_decoded(decoded, stop, level_tx, first_audio)
+                    play_buffered_fallback(&buffered, stop, level_tx, first_audio)
                 }
                 None => {
+                    let mut result = Ok(());
                     if let Some(mut p) = pipeline {
-                        p.finish(&mut first_audio);
-                        p.drain(&stop);
+                        result = p.finish(&mut first_audio);
+                        if result.is_ok() {
+                            p.drain(&stop);
+                        }
                         drop(p);
                     }
                     reset_level(&level_tx);
-                    Ok(())
+                    result
                 }
             }
         }
     }
+}
+
+/// Play a body the incremental decoder could not handle, once it has fully
+/// arrived. When `stop` is set by then (checked after decoding, which can take
+/// a moment on a long clip) nothing is played, the device is never opened and
+/// a decode failure is not reported: the user already cancelled.
+fn play_buffered_fallback(
+    buffered: &[u8],
+    stop: Arc<AtomicBool>,
+    level_tx: Option<tokio::sync::watch::Sender<f32>>,
+    first_audio: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), WhisrsError> {
+    let decoded = decode_wav(buffered);
+    if stop.load(Ordering::Acquire) {
+        debug!("TTS playback interrupted");
+        if let Some(tx) = &level_tx {
+            let _ = tx.send(0.0);
+        }
+        return Ok(());
+    }
+    play_decoded(decoded?, stop, level_tx, first_audio)
 }
 
 // ---------------------------------------------------------------------------
@@ -952,20 +982,26 @@ impl StreamPipeline {
         &mut self,
         decoded: &[f32],
         first_audio: &mut Option<tokio::sync::oneshot::Sender<()>>,
-    ) {
+    ) -> Result<(), WhisrsError> {
         self.scratch.clear();
         self.resampler.push(decoded, &mut self.scratch);
-        self.enqueue(first_audio);
+        self.enqueue(first_audio)
     }
 
     /// Flush the resampler tail at end of stream.
-    fn finish(&mut self, first_audio: &mut Option<tokio::sync::oneshot::Sender<()>>) {
+    fn finish(
+        &mut self,
+        first_audio: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<(), WhisrsError> {
         self.scratch.clear();
         self.resampler.finish(&mut self.scratch);
-        self.enqueue(first_audio);
+        self.enqueue(first_audio)
     }
 
-    fn enqueue(&mut self, first_audio: &mut Option<tokio::sync::oneshot::Sender<()>>) {
+    fn enqueue(
+        &mut self,
+        first_audio: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<(), WhisrsError> {
         let mut first = || {
             if let Some(tx) = first_audio.take() {
                 debug!("TTS first audio queued");
@@ -977,8 +1013,9 @@ impl StreamPipeline {
             &self.scratch,
             self.batch,
             &self.stop,
+            DEVICE_STALL_TIMEOUT,
             &mut first,
-        );
+        )
     }
 
     fn queued(&self) -> usize {
@@ -1014,8 +1051,12 @@ impl StreamPipeline {
 /// Append `samples` to the fixed-capacity `queue` without ever growing it,
 /// copying at most `batch` samples per lock acquisition and sleeping with the
 /// lock released while the queue is full. `on_first_push` runs once, after
-/// the first samples land. Returns early (dropping the rest) when `stop` is set or the
-/// lock is poisoned.
+/// the first samples land. Returns `Ok` early (dropping the rest) when `stop`
+/// is set or the lock is poisoned.
+///
+/// Returns `Err` when the queue stays full for `stall_timeout` without the
+/// consumer taking a single sample: the device has stopped pulling, and
+/// waiting on it would hang read-aloud in Speaking until `stop`.
 ///
 /// This keeps the lock the audio callback `try_lock`s short, bounded and
 /// allocation-free; a failed `try_lock` there costs a buffer of silence.
@@ -1024,17 +1065,20 @@ fn enqueue_bounded(
     samples: &[f32],
     batch: usize,
     stop: &AtomicBool,
+    stall_timeout: Duration,
     on_first_push: &mut dyn FnMut(),
-) {
+) -> Result<(), WhisrsError> {
     let mut rest = samples;
     let mut pushed_any = false;
+    // Last time room appeared in the queue, i.e. the consumer made progress.
+    let mut last_progress = Instant::now();
     while !rest.is_empty() {
         if stop.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
         let pushed = {
             let Ok(mut q) = queue.lock() else {
-                return;
+                return Ok(());
             };
             let room = q.capacity() - q.len();
             let n = room.min(batch).min(rest.len());
@@ -1042,16 +1086,23 @@ fn enqueue_bounded(
             n
         };
         if pushed == 0 {
+            if last_progress.elapsed() >= stall_timeout {
+                return Err(WhisrsError::Audio(
+                    "audio output stalled: device stopped consuming samples".to_string(),
+                ));
+            }
             // Full: seconds of audio are queued, so a short wait is harmless.
-            std::thread::sleep(STREAM_POLL);
+            std::thread::sleep(STREAM_POLL.min(stall_timeout));
             continue;
         }
+        last_progress = Instant::now();
         if !pushed_any {
             pushed_any = true;
             on_first_push();
         }
         rest = &rest[pushed..];
     }
+    Ok(())
 }
 
 /// Normalized playback amplitude from a buffer of interleaved f32 samples.
@@ -1772,6 +1823,9 @@ mod tests {
 
     // --- bounded enqueue --------------------------------------------------
 
+    /// Stall timeout for tests that must never hit it.
+    const TEST_STALL: Duration = Duration::from_secs(60);
+
     #[test]
     fn enqueue_bounded_never_grows_the_queue_and_keeps_order() {
         let queue = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(64)));
@@ -1796,7 +1850,7 @@ mod tests {
             })
         };
         let mut firsts = 0;
-        enqueue_bounded(&queue, &samples, 16, &stop, &mut || firsts += 1);
+        enqueue_bounded(&queue, &samples, 16, &stop, TEST_STALL, &mut || firsts += 1).unwrap();
         assert_eq!(consumer.join().unwrap(), samples);
         assert_eq!(firsts, 1);
         assert_eq!(queue.lock().unwrap().capacity(), cap);
@@ -1814,7 +1868,15 @@ mod tests {
                 stop.store(true, Ordering::Release);
             });
             // Nothing drains the queue, so this must be ended by `stop`.
-            enqueue_bounded(&queue, &vec![0.5; cap * 4], 4, &stop, &mut || firsts += 1);
+            let r = enqueue_bounded(
+                &queue,
+                &vec![0.5; cap * 4],
+                4,
+                &stop,
+                TEST_STALL,
+                &mut || firsts += 1,
+            );
+            assert!(r.is_ok(), "stop is not a stall: {r:?}");
         });
         assert_eq!(queue.lock().unwrap().len(), cap);
         assert_eq!(firsts, 1);
@@ -1825,9 +1887,84 @@ mod tests {
         let queue = Mutex::new(VecDeque::<f32>::with_capacity(8));
         let stop = AtomicBool::new(true);
         let mut firsts = 0;
-        enqueue_bounded(&queue, &[0.1; 4], 4, &stop, &mut || firsts += 1);
+        enqueue_bounded(&queue, &[0.1; 4], 4, &stop, TEST_STALL, &mut || firsts += 1).unwrap();
         assert!(queue.lock().unwrap().is_empty());
         assert_eq!(firsts, 0);
+    }
+
+    #[test]
+    fn enqueue_bounded_gives_up_when_nothing_drains() {
+        let queue = Mutex::new(VecDeque::<f32>::with_capacity(8));
+        let cap = queue.lock().unwrap().capacity();
+        let stop = AtomicBool::new(false);
+        let mut firsts = 0;
+        let start = Instant::now();
+        let result = enqueue_bounded(
+            &queue,
+            &vec![0.5; cap * 4],
+            4,
+            &stop,
+            Duration::from_millis(100),
+            &mut || firsts += 1,
+        );
+        let elapsed = start.elapsed();
+        match result {
+            Err(WhisrsError::Audio(msg)) => assert_eq!(
+                msg,
+                "audio output stalled: device stopped consuming samples"
+            ),
+            other => panic!("expected a stall error, got {other:?}"),
+        }
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "gave up early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "gave up late: {elapsed:?}"
+        );
+        assert_eq!(queue.lock().unwrap().len(), cap);
+        assert_eq!(firsts, 1);
+    }
+
+    #[test]
+    fn enqueue_bounded_slow_draining_is_not_a_stall() {
+        let queue = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(8)));
+        let cap = queue.lock().unwrap().capacity();
+        let stop = AtomicBool::new(false);
+        let total = cap * 5;
+        let samples: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        let stall = Duration::from_millis(150);
+
+        // Takes a few samples every 50 ms: well under `stall` per step, but
+        // the whole enqueue takes several multiples of it.
+        let consumer = {
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || {
+                let mut got = Vec::new();
+                while got.len() < total {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let mut q = queue.lock().unwrap();
+                    let n = q.len().min(4);
+                    got.extend(q.drain(..n));
+                }
+                got
+            })
+        };
+        let start = Instant::now();
+        let mut firsts = 0;
+        let result = enqueue_bounded(&queue, &samples, 4, &stop, stall, &mut || firsts += 1);
+        let enqueue_time = start.elapsed();
+        assert!(
+            result.is_ok(),
+            "slow draining tripped the stall guard: {result:?}"
+        );
+        assert!(
+            enqueue_time > stall * 2,
+            "test did not exercise a long enqueue: {enqueue_time:?}"
+        );
+        assert_eq!(consumer.join().unwrap(), samples);
+        assert_eq!(firsts, 1);
     }
 
     // --- stream stop / disconnect classification (no device opened) -------
@@ -1845,11 +1982,62 @@ mod tests {
     }
 
     #[test]
-    fn stream_stopped_with_buffered_body_plays_nothing() {
-        // A non-WAV body would take the buffered fallback on `End`.
-        let (result, fired) = run_stream(vec![StreamChunk::Data(b"not a wav".to_vec())], true);
+    fn stream_stopped_before_first_chunk_plays_nothing() {
+        let (result, fired) = run_stream(
+            vec![StreamChunk::Data(b"not a wav".to_vec()), StreamChunk::End],
+            true,
+        );
         assert!(result.is_ok());
         assert!(!fired, "first_audio must not fire on stop");
+    }
+
+    /// `play_buffered_fallback` with `stop` set; `stop` is checked before the
+    /// device would be opened, so no audio device is touched.
+    fn run_fallback_stopped(body: &[u8]) -> (Result<(), WhisrsError>, bool, f32) {
+        let (first_tx, mut first_rx) = tokio::sync::oneshot::channel();
+        let (level_tx, level_rx) = tokio::sync::watch::channel(0.7f32);
+        let result = play_buffered_fallback(
+            body,
+            Arc::new(AtomicBool::new(true)),
+            Some(level_tx),
+            Some(first_tx),
+        );
+        let fired = first_rx.try_recv().is_ok();
+        let level = *level_rx.borrow();
+        (result, fired, level)
+    }
+
+    #[test]
+    fn buffered_fallback_stopped_after_end_plays_nothing() {
+        // Stop set once the body has fully arrived: a decodable body is
+        // dropped without opening the device.
+        let (result, fired, level) = run_fallback_stopped(&make_i16_wav(24_000, 1, 2_400));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!fired, "first_audio must not fire on stop");
+        assert_eq!(level, 0.0, "level must be reset on stop");
+    }
+
+    #[test]
+    fn buffered_fallback_stopped_suppresses_decode_error() {
+        let (result, fired, _) = run_fallback_stopped(b"not a wav");
+        assert!(
+            result.is_ok(),
+            "a cancelled read must not report {result:?}"
+        );
+        assert!(!fired);
+    }
+
+    #[test]
+    fn buffered_fallback_undecodable_body_is_an_error_when_not_stopped() {
+        let (first_tx, mut first_rx) = tokio::sync::oneshot::channel();
+        let result = play_buffered_fallback(
+            b"not a wav",
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Some(first_tx),
+        );
+        assert!(matches!(result, Err(WhisrsError::Audio(_))), "{result:?}");
+        assert!(first_rx.try_recv().is_err());
     }
 
     #[test]

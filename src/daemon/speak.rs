@@ -169,12 +169,11 @@ pub(crate) async fn handle_speak(
                 error!("speak: synthesis failed: {e}");
                 finish_session(&mut ds, &context);
                 drop(ds);
+                let (notification, message) = synthesis_failure_messages(e);
                 if context.notify_error() {
-                    send_notification("whisrs", &format!("Read-aloud failed: {e}"));
+                    send_notification("whisrs", &notification);
                 }
-                return Response::Error {
-                    message: format!("TTS synthesis failed: {e}"),
-                };
+                return Response::Error { message };
             }
         }
     };
@@ -322,6 +321,16 @@ fn inner_message(e: whisrs::WhisrsError) -> String {
     }
 }
 
+/// The notification and IPC error text for a failed synthesis request, framed
+/// like the playback failures (no nested "transcription error: " prefix).
+fn synthesis_failure_messages(e: whisrs::WhisrsError) -> (String, String) {
+    let msg = inner_message(e);
+    (
+        format!("Read-aloud failed: {msg}"),
+        format!("TTS synthesis failed: {msg}"),
+    )
+}
+
 /// How often `stop` is re-checked while waiting on the network.
 const STOP_POLL: Duration = Duration::from_millis(50);
 
@@ -418,6 +427,17 @@ mod tests {
             Some("no default audio output device")
         );
         assert_eq!(playback_failure(Ok(Ok(()))), None);
+    }
+
+    #[test]
+    fn synthesis_failure_messages_drop_the_error_category_prefix() {
+        let e = whisrs::WhisrsError::Transcription("TTS error (503): overloaded".into());
+        let (notification, message) = synthesis_failure_messages(e);
+        assert_eq!(
+            notification,
+            "Read-aloud failed: TTS error (503): overloaded"
+        );
+        assert_eq!(message, "TTS synthesis failed: TTS error (503): overloaded");
     }
 
     #[tokio::test]
