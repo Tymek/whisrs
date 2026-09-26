@@ -1,8 +1,8 @@
 //! Deepgram Aura-2 text-to-speech backend.
 //!
 //! POSTs to Deepgram's `/v1/speak` endpoint requesting 24 kHz linear16 audio
-//! wrapped in a WAV container, so the bytes can be decoded by
-//! [`crate::audio::playback::decode_wav`] without further conversion.
+//! wrapped in a WAV container. The body is returned as a chunk stream so
+//! playback can start before the whole clip has been synthesized.
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -10,7 +10,7 @@ use tracing::debug;
 
 use crate::WhisrsError;
 
-use super::TtsBackend;
+use super::{HttpAudioStream, TtsAudioStream, TtsBackend};
 
 /// Deepgram speak endpoint (model + audio params are passed as query params).
 const DEEPGRAM_SPEAK_URL: &str = "https://api.deepgram.com/v1/speak";
@@ -66,7 +66,7 @@ struct SpeechRequest<'a> {
 
 #[async_trait]
 impl TtsBackend for DeepgramAuraTts {
-    async fn synthesize(&self, text: &str) -> Result<Vec<u8>, WhisrsError> {
+    async fn synthesize(&self, text: &str) -> Result<Box<dyn TtsAudioStream>, WhisrsError> {
         if text.trim().is_empty() {
             return Err(WhisrsError::Transcription(
                 "cannot synthesize empty text".to_string(),
@@ -99,11 +99,7 @@ impl TtsBackend for DeepgramAuraTts {
             )));
         }
 
-        let bytes = response.bytes().await.map_err(|e| {
-            WhisrsError::Transcription(format!("Deepgram TTS read body failed: {e}"))
-        })?;
-
-        Ok(bytes.to_vec())
+        Ok(Box::new(HttpAudioStream::new(response, "Deepgram TTS")))
     }
 }
 
@@ -149,7 +145,11 @@ mod tests {
     #[tokio::test]
     async fn synthesize_rejects_empty_text() {
         let backend = DeepgramAuraTts::new("test-key".to_string(), "aura-2-thalia-en".to_string());
-        let err = backend.synthesize("   ").await.unwrap_err();
+        let err = backend
+            .synthesize("   ")
+            .await
+            .err()
+            .expect("empty text must fail");
         assert!(err.to_string().contains("empty text"));
     }
 }
