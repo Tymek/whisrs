@@ -6,11 +6,14 @@
 
 use async_trait::async_trait;
 use serde::Serialize;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::WhisrsError;
 
-use super::TtsBackend;
+use super::{stream_response, TtsBackend};
 
 /// Deepgram speak endpoint (model + audio params are passed as query params).
 const DEEPGRAM_SPEAK_URL: &str = "https://api.deepgram.com/v1/speak";
@@ -56,6 +59,37 @@ impl DeepgramAuraTts {
             self.model
         )
     }
+
+    async fn request(&self, text: &str) -> Result<reqwest::Response, WhisrsError> {
+        if text.trim().is_empty() {
+            return Err(WhisrsError::Transcription(
+                "cannot synthesize empty text".into(),
+            ));
+        }
+        debug!(
+            "sending {} chars to Deepgram Aura (model={})",
+            text.len(),
+            self.model
+        );
+        let response = self
+            .client
+            .post(self.request_url())
+            .header("Authorization", format!("Token {}", self.api_key))
+            .json(&self.request_body(text))
+            .send()
+            .await
+            .map_err(|e| WhisrsError::Transcription(format!("Deepgram TTS request failed: {e}")))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(WhisrsError::Transcription(format!(
+                "Deepgram TTS error ({}): {}",
+                status.as_u16(),
+                body
+            )));
+        }
+        Ok(response)
+    }
 }
 
 /// Request body for Deepgram's text-to-speech endpoint.
@@ -67,43 +101,20 @@ struct SpeechRequest<'a> {
 #[async_trait]
 impl TtsBackend for DeepgramAuraTts {
     async fn synthesize(&self, text: &str) -> Result<Vec<u8>, WhisrsError> {
-        if text.trim().is_empty() {
-            return Err(WhisrsError::Transcription(
-                "cannot synthesize empty text".to_string(),
-            ));
-        }
-
-        let url = self.request_url();
-        debug!(
-            "sending {} chars to Deepgram Aura (model={})",
-            text.len(),
-            self.model
-        );
-
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Token {}", self.api_key))
-            .json(&self.request_body(text))
-            .send()
-            .await
-            .map_err(|e| WhisrsError::Transcription(format!("Deepgram TTS request failed: {e}")))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(WhisrsError::Transcription(format!(
-                "Deepgram TTS error ({}): {}",
-                status.as_u16(),
-                body
-            )));
-        }
-
-        let bytes = response.bytes().await.map_err(|e| {
+        let bytes = self.request(text).await?.bytes().await.map_err(|e| {
             WhisrsError::Transcription(format!("Deepgram TTS read body failed: {e}"))
         })?;
-
         Ok(bytes.to_vec())
+    }
+
+    async fn synthesize_stream(
+        &self,
+        text: &str,
+        sender: mpsc::Sender<Vec<u8>>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<(), WhisrsError> {
+        let response = self.request(text).await?;
+        stream_response(response, sender, stop).await
     }
 }
 

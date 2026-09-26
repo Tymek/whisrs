@@ -19,6 +19,9 @@ pub mod groq;
 pub mod openai_compat;
 
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use crate::{TtsConfig, WhisrsError};
 
@@ -41,12 +44,52 @@ const SIDECAR_DEFAULT_VOICE: &str = "af_heart";
 
 /// Trait for text-to-speech backends.
 ///
-/// Each backend takes input text and returns synthesized speech as WAV bytes,
-/// ready to be decoded and played by [`crate::audio::playback::play_wav`].
+/// Backends can return a whole WAV or send its body incrementally for playback.
 #[async_trait]
 pub trait TtsBackend: Send + Sync {
     /// Synthesize `text` into speech, returning WAV-encoded audio bytes.
     async fn synthesize(&self, text: &str) -> Result<Vec<u8>, WhisrsError>;
+
+    /// Send WAV body chunks as they arrive; returns when the response ends.
+    async fn synthesize_stream(
+        &self,
+        text: &str,
+        sender: mpsc::Sender<Vec<u8>>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<(), WhisrsError>;
+}
+
+/// Forward an HTTP response to the bounded playback queue without buffering it.
+pub(crate) async fn stream_response(
+    mut response: reqwest::Response,
+    sender: mpsc::Sender<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+) -> Result<(), WhisrsError> {
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let chunk = tokio::select! {
+            chunk = response.chunk() => chunk.map_err(|e| WhisrsError::Transcription(format!("TTS read body failed: {e}")))?,
+            _ = sender.closed() => return Ok(()),
+            _ = async {
+                while !stop.load(Ordering::Acquire) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            } => return Ok(()),
+        };
+        let Some(chunk) = chunk else {
+            return Ok(());
+        };
+        tokio::select! {
+            result = sender.send(chunk.to_vec()) => { if result.is_err() { return Ok(()); } },
+            _ = async {
+                while !stop.load(Ordering::Acquire) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            } => return Ok(()),
+        }
+    }
 }
 
 /// Build the configured TTS backend.

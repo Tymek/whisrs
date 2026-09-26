@@ -7,6 +7,7 @@
 
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -156,6 +157,325 @@ pub fn play_wav(
 ) -> Result<(), WhisrsError> {
     let decoded = decode_wav(wav_bytes)?;
     play_decoded(decoded, stop, level_tx)
+}
+
+type StreamOutput = (
+    cpal::Stream,
+    SyncSender<Vec<f32>>,
+    Arc<AtomicBool>,
+    u32,
+    u16,
+);
+
+/// Incremental playback of PCM16 or IEEE float32 RIFF/WAVE bytes.
+///
+/// `first_chunk` is consumed before receiving subsequent chunks (including when
+/// it is empty). Run on a blocking task. Unsupported WAV formats are buffered and passed to
+/// `play_wav` at EOF; once playback starts, an error never replays the clip.
+/// The producer must drop its sender to signal EOF. `blocking_recv` cannot
+/// observe `stop` while idle: on cancellation, the producer must drop its
+/// sender (for example, by selecting on its cancellation signal). `stop` is
+/// checked between received chunks and during playback. Do not call from an
+/// async runtime worker; use `spawn_blocking`.
+/// The output callback never waits for the producer: an empty queue emits silence.
+pub fn play_wav_stream(
+    first_chunk: Vec<u8>,
+    mut receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+    level_tx: Option<tokio::sync::watch::Sender<f32>>,
+) -> Result<(), WhisrsError> {
+    let mut parser = StreamWavParser::default();
+    let mut buffered = Some(Vec::new());
+    let mut output: Option<StreamOutput> = None;
+    let mut played_frames = 0usize;
+    let mut first_chunk = Some(first_chunk);
+
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        let bytes = match first_chunk.take() {
+            Some(bytes) => bytes,
+            None => match receiver.blocking_recv() {
+                Some(bytes) => bytes,
+                None => break,
+            },
+        };
+        if let Some(raw) = &mut buffered {
+            raw.extend_from_slice(&bytes);
+        }
+        if parser.fallback {
+            continue;
+        }
+        let samples = parser.feed(&bytes);
+        if parser.fallback {
+            if output.is_some() {
+                return Err(WhisrsError::Audio(
+                    "invalid WAV after playback started".into(),
+                ));
+            }
+            continue;
+        }
+        if samples.is_empty() {
+            continue;
+        }
+        if output.is_none() {
+            let (stream, tx, done, rate, channels) =
+                open_stream_output(Arc::clone(&stop), level_tx.clone())?;
+            output = Some((stream, tx, done, rate, channels));
+            buffered = None;
+        }
+        let (_, tx, _, rate, channels) = output.as_ref().expect("output opened");
+        let fmt = parser.format.expect("samples require fmt");
+        let samples = resample_remap(&samples, fmt.channels, fmt.rate, *channels, *rate);
+        played_frames += samples.len() / *channels as usize;
+        let mut pending = samples;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+            match tx.try_send(pending) {
+                Ok(()) => break,
+                Err(TrySendError::Full(samples)) => {
+                    pending = samples;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(WhisrsError::Audio("playback stream closed".into()));
+                }
+            }
+        }
+    }
+
+    if !stop.load(Ordering::Acquire) {
+        if let Some((stream, tx, done, rate, _)) = output {
+            if !parser.complete() {
+                return Err(WhisrsError::Audio("truncated WAV sample data".into()));
+            }
+            drop(tx); // the callback drains the queue before marking completion
+            let deadline = Instant::now()
+                + Duration::from_secs_f64(played_frames as f64 / rate.max(1) as f64 + 2.0);
+            while !done.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+                if Instant::now() >= deadline {
+                    debug!("streaming TTS playback timed out");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            drop(stream);
+        } else if let Some(raw) = buffered {
+            if !raw.is_empty() {
+                return play_wav(&raw, stop, level_tx);
+            }
+        }
+    }
+    if let Some(tx) = &level_tx {
+        let _ = tx.send(0.0);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StreamFormat {
+    channels: u16,
+    rate: u32,
+    bytes_per_sample: usize,
+    float: bool,
+}
+
+#[derive(Default)]
+struct StreamWavParser {
+    pending: Vec<u8>,
+    format: Option<StreamFormat>,
+    header_parsed: bool,
+    data_remaining: Option<usize>, // None for sentinel-sized data
+    in_data: bool,
+    fallback: bool,
+}
+
+impl StreamWavParser {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<f32> {
+        if self.fallback {
+            return Vec::new();
+        }
+        self.pending.extend_from_slice(bytes);
+        if !self.in_data {
+            if !self.header_parsed {
+                if self.pending.len() < 12 {
+                    return Vec::new();
+                }
+                if &self.pending[..4] != b"RIFF" || &self.pending[8..12] != b"WAVE" {
+                    self.fallback = true;
+                    return Vec::new();
+                }
+                self.pending.drain(..12);
+                self.header_parsed = true;
+            }
+            let mut offset = 0;
+            loop {
+                if self.pending.len() - offset < 8 {
+                    break;
+                }
+                let id = &self.pending[offset..offset + 4];
+                let len =
+                    u32::from_le_bytes(self.pending[offset + 4..offset + 8].try_into().unwrap());
+                if id == b"data" {
+                    if self.format.is_none() {
+                        self.fallback = true;
+                        return Vec::new();
+                    }
+                    let fmt = self.format.expect("format checked above");
+                    if len != u32::MAX
+                        && !(len as usize)
+                            .is_multiple_of(fmt.channels as usize * fmt.bytes_per_sample)
+                    {
+                        self.fallback = true;
+                        return Vec::new();
+                    }
+                    self.data_remaining = (len != u32::MAX).then_some(len as usize);
+                    self.in_data = true;
+                    self.pending.drain(..offset + 8);
+                    break;
+                }
+                if len == u32::MAX {
+                    self.fallback = true;
+                    return Vec::new();
+                }
+                let end = offset + 8 + len as usize + (len as usize & 1);
+                if end > self.pending.len() {
+                    break;
+                }
+                if id == b"fmt " {
+                    let fmt = &self.pending[offset + 8..offset + 8 + len as usize];
+                    if fmt.len() < 16 {
+                        self.fallback = true;
+                        return Vec::new();
+                    }
+                    let encoding = u16::from_le_bytes([fmt[0], fmt[1]]);
+                    let channels = u16::from_le_bytes([fmt[2], fmt[3]]);
+                    let rate = u32::from_le_bytes(fmt[4..8].try_into().unwrap());
+                    let align = u16::from_le_bytes([fmt[12], fmt[13]]) as usize;
+                    let bits = u16::from_le_bytes([fmt[14], fmt[15]]);
+                    let bytes_per_sample = (bits / 8) as usize;
+                    if channels == 0
+                        || rate == 0
+                        || align != channels as usize * bytes_per_sample
+                        || !matches!((encoding, bits), (1, 16) | (3, 32))
+                    {
+                        self.fallback = true;
+                        return Vec::new();
+                    }
+                    self.format = Some(StreamFormat {
+                        channels,
+                        rate,
+                        bytes_per_sample,
+                        float: encoding == 3,
+                    });
+                }
+                offset = end;
+            }
+            if !self.in_data {
+                self.pending.drain(..offset);
+                return Vec::new();
+            }
+        }
+        if self.data_remaining == Some(0) {
+            self.pending.clear(); // padding and subsequent RIFF chunks are not audio
+            return Vec::new();
+        }
+        let fmt = self.format.expect("data requires fmt");
+        let limit = self
+            .data_remaining
+            .unwrap_or(self.pending.len())
+            .min(self.pending.len());
+        let frame_bytes = fmt.bytes_per_sample * fmt.channels as usize;
+        let count = limit / frame_bytes * frame_bytes;
+        let mut samples = Vec::with_capacity(count / fmt.bytes_per_sample);
+        for sample in self.pending[..count].chunks_exact(fmt.bytes_per_sample) {
+            samples.push(if fmt.float {
+                f32::from_le_bytes(sample.try_into().unwrap())
+            } else {
+                i16::from_le_bytes(sample.try_into().unwrap()) as f32 / 32768.0
+            });
+        }
+        self.pending.drain(..count);
+        if let Some(remaining) = &mut self.data_remaining {
+            *remaining -= count;
+            if *remaining == 0 {
+                self.pending.clear(); // optional data pad and trailing chunks
+            }
+        }
+        samples
+    }
+
+    fn complete(&self) -> bool {
+        self.in_data && self.data_remaining.is_none_or(|n| n == 0) && self.pending.is_empty()
+    }
+}
+
+fn open_stream_output(
+    stop: Arc<AtomicBool>,
+    level_tx: Option<tokio::sync::watch::Sender<f32>>,
+) -> Result<StreamOutput, WhisrsError> {
+    let device = cpal::default_host()
+        .default_output_device()
+        .ok_or_else(|| WhisrsError::Audio("no default audio output device".into()))?;
+    let cfg = device
+        .default_output_config()
+        .map_err(|e| WhisrsError::Audio(format!("failed to get default output config: {e}")))?;
+    let rate = cfg.sample_rate().0;
+    let channels = cfg.channels().max(1);
+    let config = StreamConfig {
+        channels,
+        sample_rate: SampleRate(rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(8);
+    let done = Arc::new(AtomicBool::new(false));
+    let done_cb = Arc::clone(&done);
+    let mut current = Vec::new();
+    let mut index = 0;
+    let stream = device
+        .build_output_stream(
+            &config,
+            move |data: &mut [f32], _| {
+                for sample in data.iter_mut() {
+                    if stop.load(Ordering::Acquire) {
+                        *sample = 0.0;
+                        continue;
+                    }
+                    if index == current.len() {
+                        match rx.try_recv() {
+                            Ok(next) => {
+                                current = next;
+                                index = 0;
+                            }
+                            Err(TryRecvError::Disconnected) => {
+                                done_cb.store(true, Ordering::Release);
+                            }
+                            Err(TryRecvError::Empty) => {}
+                        }
+                    }
+                    *sample = if index < current.len() {
+                        let value = current[index];
+                        index += 1;
+                        value
+                    } else {
+                        0.0
+                    };
+                }
+                if let Some(tx) = &level_tx {
+                    let _ = tx.send(playback_level(data));
+                }
+            },
+            |err| warn!("TTS playback stream error: {err}"),
+            None,
+        )
+        .map_err(|e| WhisrsError::Audio(format!("failed to build output stream: {e}")))?;
+    stream
+        .play()
+        .map_err(|e| WhisrsError::Audio(format!("failed to start playback: {e}")))?;
+    Ok((stream, tx, done, rate, channels))
 }
 
 /// Normalized playback amplitude from a buffer of interleaved f32 samples.
@@ -453,6 +773,118 @@ mod tests {
         assert_eq!(decoded.sample_rate, 24_000);
         assert_eq!(decoded.channels, 1);
         assert_eq!(decoded.frames(), 100);
+    }
+
+    #[test]
+    fn stream_receiver_closed_or_cancelled_before_audio() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        drop(tx);
+        play_wav_stream(Vec::new(), rx, Arc::new(AtomicBool::new(false)), None).unwrap();
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(2);
+        play_wav_stream(vec![1, 2, 3], rx, Arc::new(AtomicBool::new(true)), None).unwrap();
+
+        // Dropping the sender wakes a playback thread blocked in blocking_recv.
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let playback = std::thread::spawn(move || {
+            play_wav_stream(Vec::new(), rx, Arc::new(AtomicBool::new(false)), None)
+        });
+        drop(tx);
+        playback.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn stream_first_chunk_precedes_receiver_even_if_empty() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        drop(tx);
+        assert!(play_wav_stream(
+            b"invalid WAV".to_vec(),
+            rx,
+            Arc::new(AtomicBool::new(false)),
+            None
+        )
+        .is_err());
+
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.blocking_send(b"invalid WAV".to_vec()).unwrap();
+        drop(tx);
+        assert!(play_wav_stream(Vec::new(), rx, Arc::new(AtomicBool::new(false)), None).is_err());
+    }
+
+    #[test]
+    fn stream_parser_split_headers_samples_and_padded_chunks() {
+        let wav = make_i16_wav(24_000, 1, 3);
+        let mut with_junk = wav[..12].to_vec();
+        with_junk.extend_from_slice(b"JUNK");
+        with_junk.extend_from_slice(&3u32.to_le_bytes());
+        with_junk.extend_from_slice(&[1, 2, 3, 0]);
+        with_junk.extend_from_slice(&wav[12..]);
+        let mut parser = StreamWavParser::default();
+        let mut samples = Vec::new();
+        for byte in with_junk.chunks(1) {
+            samples.extend(parser.feed(byte));
+        }
+        assert!(!parser.fallback);
+        assert!(parser.complete());
+        assert_eq!(samples, decode_wav(&wav).unwrap().samples);
+    }
+
+    #[test]
+    fn stream_parser_sentinel_and_trailing_pad() {
+        let mut wav = make_i16_wav(24_000, 1, 3);
+        let data = wav.windows(4).position(|w| w == b"data").unwrap();
+        wav[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        wav[data + 4..data + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut parser = StreamWavParser::default();
+        let mut samples = Vec::new();
+        for piece in wav.chunks(5) {
+            samples.extend(parser.feed(piece));
+        }
+        assert_eq!(samples, decode_wav(&wav).unwrap().samples);
+        assert!(parser.complete());
+
+        let mut finite = make_i16_wav(24_000, 1, 3);
+        finite.extend_from_slice(b"JUNK\0\0\0\0");
+        let mut parser = StreamWavParser::default();
+        assert_eq!(parser.feed(&finite).len(), 3);
+        assert!(parser.complete());
+        assert_eq!(parser.feed(b"trailing bytes"), Vec::<f32>::new());
+    }
+
+    #[test]
+    fn stream_parser_unsupported_format_falls_back_before_audio() {
+        let mut wav = make_i16_wav(24_000, 1, 3);
+        let fmt = wav.windows(4).position(|w| w == b"fmt ").unwrap();
+        wav[fmt + 8..fmt + 10].copy_from_slice(&6u16.to_le_bytes());
+        let mut parser = StreamWavParser::default();
+        for piece in wav.chunks(7) {
+            assert!(parser.feed(piece).is_empty());
+        }
+        assert!(parser.fallback);
+
+        // A valid format that hound supports still takes the buffered path.
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 24_000,
+            bits_per_sample: 8,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+            writer.write_sample(42i8).unwrap();
+            writer.finalize().unwrap();
+        }
+        let wav8 = cursor.into_inner();
+        let mut parser = StreamWavParser::default();
+        assert!(parser.feed(&wav8).is_empty());
+        assert!(parser.fallback);
+        assert_eq!(decode_wav(&wav8).unwrap().frames(), 1);
+
+        let mut truncated = StreamWavParser::default();
+        let wav = make_i16_wav(24_000, 1, 3);
+        truncated.feed(&wav[..wav.len() - 1]);
+        assert!(!truncated.complete());
     }
 
     #[test]

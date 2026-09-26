@@ -8,11 +8,14 @@
 
 use async_trait::async_trait;
 use serde::Serialize;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::WhisrsError;
 
-use super::TtsBackend;
+use super::{stream_response, TtsBackend};
 
 /// OpenAI-compatible text-to-speech backend.
 pub struct OpenAiCompatTts {
@@ -57,6 +60,43 @@ impl OpenAiCompatTts {
             response_format: &self.response_format,
         }
     }
+
+    async fn request(&self, text: &str) -> Result<reqwest::Response, WhisrsError> {
+        if text.trim().is_empty() {
+            return Err(WhisrsError::Transcription(
+                "cannot synthesize empty text".into(),
+            ));
+        }
+        debug!(
+            "sending {} chars to TTS at {} (model={}, voice={}, format={})",
+            text.len(),
+            self.base_url,
+            self.model,
+            self.voice,
+            self.response_format
+        );
+        let mut request = self
+            .client
+            .post(&self.base_url)
+            .json(&self.request_body(text));
+        if let Some(key) = &self.api_key {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| WhisrsError::Transcription(format!("TTS request failed: {e}")))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(WhisrsError::Transcription(format!(
+                "TTS error ({}): {}",
+                status.as_u16(),
+                body
+            )));
+        }
+        Ok(response)
+    }
 }
 
 /// Request body for the OpenAI-compatible `/v1/audio/speech` endpoint.
@@ -71,56 +111,43 @@ struct SpeechRequest<'a> {
 #[async_trait]
 impl TtsBackend for OpenAiCompatTts {
     async fn synthesize(&self, text: &str) -> Result<Vec<u8>, WhisrsError> {
-        if text.trim().is_empty() {
-            return Err(WhisrsError::Transcription(
-                "cannot synthesize empty text".to_string(),
-            ));
-        }
-
-        debug!(
-            "sending {} chars to TTS at {} (model={}, voice={}, format={})",
-            text.len(),
-            self.base_url,
-            self.model,
-            self.voice,
-            self.response_format
-        );
-
-        let mut request = self
-            .client
-            .post(&self.base_url)
-            .json(&self.request_body(text));
-        if let Some(key) = &self.api_key {
-            request = request.header("Authorization", format!("Bearer {key}"));
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| WhisrsError::Transcription(format!("TTS request failed: {e}")))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(WhisrsError::Transcription(format!(
-                "TTS error ({}): {}",
-                status.as_u16(),
-                body
-            )));
-        }
-
-        let bytes = response
+        let bytes = self
+            .request(text)
+            .await?
             .bytes()
             .await
             .map_err(|e| WhisrsError::Transcription(format!("TTS read body failed: {e}")))?;
-
         Ok(bytes.to_vec())
+    }
+
+    async fn synthesize_stream(
+        &self,
+        text: &str,
+        sender: mpsc::Sender<Vec<u8>>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<(), WhisrsError> {
+        let response = self.request(text).await?;
+        stream_response(response, sender, stop).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::time::{timeout, Duration};
+
+    fn local_backend(port: u16) -> OpenAiCompatTts {
+        OpenAiCompatTts::new(
+            format!("http://127.0.0.1:{port}/v1/audio/speech"),
+            None,
+            "test-model".into(),
+            "test-voice".into(),
+            "wav".into(),
+        )
+    }
 
     #[test]
     fn request_body_serializes_expected_shape() {
@@ -150,6 +177,90 @@ mod tests {
             "wav".to_string(),
         );
         assert!(backend.api_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn synthesize_stream_delivers_first_wav_bytes_before_final_chunk() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(listener.local_addr().unwrap().port());
+        let (release_final, final_allowed) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut method = [0; 4];
+            socket.read_exact(&mut method).await.unwrap();
+            assert_eq!(&method, b"POST");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: audio/wav\r\n\r\nC\r\nRIFF\x24\x00\x00\x00WAVE\r\n")
+                .await
+                .unwrap();
+            final_allowed.await.unwrap();
+            socket.write_all(b"4\r\nfmt \r\n0\r\n\r\n").await.unwrap();
+        });
+
+        let (sender, mut receiver) = mpsc::channel(2);
+        let synthesis = tokio::spawn(async move {
+            backend
+                .synthesize_stream("hello", sender, Arc::new(AtomicBool::new(false)))
+                .await
+        });
+        let first = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("first chunk must arrive while final chunk is withheld")
+            .expect("stream ended before first chunk");
+        assert_eq!(first, b"RIFF\x24\x00\x00\x00WAVE");
+        assert!(!synthesis.is_finished());
+
+        release_final.send(()).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"fmt "
+        );
+        timeout(Duration::from_secs(5), synthesis)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(receiver.recv().await.is_none());
+        timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn synthesize_stream_reports_status_error_without_sending_chunks() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = local_backend(listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut method = [0; 4];
+            socket.read_exact(&mut method).await.unwrap();
+            assert_eq!(&method, b"POST");
+            socket
+                .write_all(b"HTTP/1.1 429 Too Many Requests\r\nTransfer-Encoding: chunked\r\n\r\nC\r\nrate limited\r\n0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let (sender, mut receiver) = mpsc::channel(2);
+        let err = timeout(
+            Duration::from_secs(5),
+            backend.synthesize_stream("hello", sender, Arc::new(AtomicBool::new(false))),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("429"), "{message}");
+        assert!(message.contains("rate limited"), "{message}");
+        assert!(receiver.recv().await.is_none(), "error response sent audio");
+        timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

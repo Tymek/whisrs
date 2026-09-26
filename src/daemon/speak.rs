@@ -106,6 +106,7 @@ pub(crate) async fn handle_speak(
 
     // (d) Re-lock; only begin synthesizing if still Idle (a concurrent command
     // may have intervened). Do NOT proceed otherwise.
+    let stop = Arc::new(AtomicBool::new(false));
     {
         let mut ds = daemon_state.lock().await;
         if ds.state_machine.state() != State::Idle {
@@ -113,6 +114,7 @@ pub(crate) async fn handle_speak(
                 state: ds.state_machine.state(),
             };
         }
+        ds.tts_stop = Some(Arc::clone(&stop));
         let _ = ds.state_machine.transition(Action::SpeakStart);
         let _ = context.state_tx.send(ds.state_machine.state());
     }
@@ -122,8 +124,22 @@ pub(crate) async fn handle_speak(
         send_notification("whisrs", "Reading selection aloud...");
     }
 
-    // (e) Synthesize (no lock held).
-    let synth_result = backend.synthesize(&selected_text).await;
+    // (e) Start a bounded producer and wait only for the first body chunk.
+    // Waiting here keeps HTTP errors visible to the caller and permits a second
+    // Speak to cancel synthesis before playback begins.
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+    let producer_stop = Arc::clone(&stop);
+    let producer = tokio::spawn(async move {
+        tokio::select! {
+            result = backend.synthesize_stream(&selected_text, sender, Arc::clone(&producer_stop)) => result,
+            _ = async {
+                while !producer_stop.load(Ordering::Acquire) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            } => Ok(()),
+        }
+    });
+    let first_chunk = receiver.recv().await;
 
     // (f) Re-lock to decide whether to play.
     let final_state = {
@@ -138,10 +154,26 @@ pub(crate) async fn handle_speak(
             };
         }
 
-        let wav_bytes = match synth_result {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                error!("speak: synthesis failed: {e}");
+        let first_chunk = match first_chunk {
+            Some(bytes) => bytes,
+            None => {
+                // The producer has closed the channel: get its HTTP/body error.
+                drop(ds);
+                let message = match producer.await {
+                    Ok(Err(e)) => e.to_string(),
+                    Ok(Ok(())) => "TTS returned an empty response".to_string(),
+                    Err(e) => format!("TTS task failed: {e}"),
+                };
+                let mut ds = daemon_state.lock().await;
+                if ds.state_machine.state() != State::Synthesizing
+                    || !ds.tts_stop.as_ref().is_some_and(|s| Arc::ptr_eq(s, &stop))
+                {
+                    return Response::Ok {
+                        state: ds.state_machine.state(),
+                    };
+                }
+                error!("speak: synthesis failed: {message}");
+                ds.tts_stop = None;
                 let _ = ds.state_machine.transition(Action::SpeakDone);
                 let _ = context.state_tx.send(ds.state_machine.state());
                 if let Some(level_tx) = &context.overlay_level_tx {
@@ -149,16 +181,13 @@ pub(crate) async fn handle_speak(
                 }
                 drop(ds);
                 if context.notify_error() {
-                    send_notification("whisrs", &format!("Read-aloud failed: {e}"));
+                    send_notification("whisrs", &format!("Read-aloud failed: {message}"));
                 }
                 return Response::Error {
-                    message: format!("TTS synthesis failed: {e}"),
+                    message: format!("TTS synthesis failed: {message}"),
                 };
             }
         };
-
-        let stop = Arc::new(AtomicBool::new(false));
-        ds.tts_stop = Some(Arc::clone(&stop));
         let _ = ds.state_machine.transition(Action::SpeakPlaying);
         let new_state = ds.state_machine.state();
         let _ = context.state_tx.send(new_state);
@@ -169,10 +198,16 @@ pub(crate) async fn handle_speak(
         let playback_stop = Arc::clone(&stop);
         let level_tx = context.overlay_level_tx.clone();
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                whisrs::audio::playback::play_wav(&wav_bytes, stop, level_tx)
-            })
-            .await;
+            let playback = tokio::task::spawn_blocking(move || {
+                whisrs::audio::playback::play_wav_stream(first_chunk, receiver, stop, level_tx)
+            });
+            // Playback drains concurrently with synthesis, not after it.
+            let result = playback.await;
+            match producer.await {
+                Ok(Err(e)) => warn!("speak: TTS stream failed: {e}"),
+                Err(e) => warn!("speak: TTS task panicked: {e}"),
+                _ => {}
+            }
             match result {
                 Ok(Ok(())) => debug!("speak: playback finished"),
                 Ok(Err(e)) => warn!("speak: playback failed: {e}"),
