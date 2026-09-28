@@ -2023,9 +2023,9 @@ api_key = "tts-SECRET-gggg"
                 let summary = key_summary(&toml, &[(var, "env-key-9876")]);
                 assert!(
                     summary.contains("****9876") && summary.contains(var),
-                    "{backend}: {summary}"
+                    "{backend}"
                 );
-                assert!(summary.contains("this shell"), "{backend}: {summary}");
+                assert!(summary.contains("this shell"), "{backend}");
             }
         }
     }
@@ -2039,13 +2039,13 @@ api_key = "tts-SECRET-gggg"
             let both = key_summary(&toml, &[(var, "env-key-9876")]);
             assert!(
                 both.contains("****9876") && both.contains(var) && !both.contains("1234"),
-                "{backend}: {both}"
+                "{backend}"
             );
 
             let file_only = key_summary(&toml, &[]);
             assert!(
                 file_only.contains("****1234") && !file_only.contains(var),
-                "{backend}: {file_only}"
+                "{backend}"
             );
         }
     }
@@ -2059,8 +2059,8 @@ api_key = "tts-SECRET-gggg"
             } else {
                 "not set"
             };
-            assert!(summary.contains(expected), "{backend}: {summary}");
-            assert!(!summary.contains(var), "{backend}: {summary}");
+            assert!(summary.contains(expected), "{backend}");
+            assert!(!summary.contains(var), "{backend}");
         }
     }
 
@@ -2070,21 +2070,18 @@ api_key = "tts-SECRET-gggg"
     fn key_summary_follows_each_backends_blank_env_rule() {
         let groq = "[general]\nbackend = \"groq\"\n[groq]\napi_key = \"file-key-1234\"\n";
         let empty = key_summary(groq, &[("WHISRS_GROQ_API_KEY", "")]);
-        assert!(empty.contains("****1234"), "{empty}");
+        assert!(empty.contains("****1234"));
         let spaces = key_summary(groq, &[("WHISRS_GROQ_API_KEY", "     ")]);
-        assert!(spaces.contains("WHISRS_GROQ_API_KEY"), "{spaces}");
+        assert!(spaces.contains("WHISRS_GROQ_API_KEY"));
 
         let sidecar = "[general]\nbackend = \"asr-sidecar\"\n\
                        [asr-sidecar]\napi_key = \"file-key-1234\"\n";
         let spaces = key_summary(sidecar, &[("WHISRS_ASR_SIDECAR_API_KEY", "   ")]);
-        assert!(
-            spaces.contains("****1234") && !spaces.contains("WHISRS_"),
-            "{spaces}"
-        );
+        assert!(spaces.contains("****1234") && !spaces.contains("WHISRS_"));
         let padded = key_summary(
             sidecar,
             &[("WHISRS_ASR_SIDECAR_API_KEY", " env-key-9876\n")],
         );
-        assert!(padded.contains("****9876"), "{padded}");
+        assert!(padded.contains("****9876"));
     }
 }
