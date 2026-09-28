@@ -206,10 +206,34 @@ fn print_summary(config: &Config) {
 /// last 4 chars so the user can tell which key they're looking at without
 /// leaking the full secret.
 fn current_key_summary(config: &Config) -> String {
-    let key = match config.general.backend.as_str() {
-        "groq" => config.groq.as_ref().map(|g| g.api_key.as_str()),
-        "deepgram" | "deepgram-streaming" => config.deepgram.as_ref().map(|d| d.api_key.as_str()),
-        "openai" | "openai-realtime" => config.openai.as_ref().map(|o| o.api_key.as_str()),
+    current_key_summary_from(config, |name| std::env::var(name).ok())
+}
+
+/// [`current_key_summary`] with the environment passed in, so tests never
+/// touch the process env. Mirrors the daemon's resolvers in `factory.rs`: a
+/// `WHISRS_*_API_KEY` env var wins over `config.toml`. A key from the env is
+/// labelled "this shell", since a daemon run by systemd takes its env from the
+/// user manager and may not see it.
+fn current_key_summary_from(config: &Config, env: impl Fn(&str) -> Option<String>) -> String {
+    let from_env = |var: &str, key: &str| {
+        format!(
+            "{BOLD}{}{RESET} {DIM}({var}, this shell){RESET}",
+            setup::mask_api_key(key)
+        )
+    };
+    let (var, key) = match config.general.backend.as_str() {
+        "groq" => (
+            "WHISRS_GROQ_API_KEY",
+            config.groq.as_ref().map(|g| g.api_key.as_str()),
+        ),
+        "deepgram" | "deepgram-streaming" => (
+            "WHISRS_DEEPGRAM_API_KEY",
+            config.deepgram.as_ref().map(|d| d.api_key.as_str()),
+        ),
+        "openai" | "openai-realtime" => (
+            "WHISRS_OPENAI_API_KEY",
+            config.openai.as_ref().map(|o| o.api_key.as_str()),
+        ),
         "local-whisper" | "local" | "local-vosk" | "local-parakeet" => {
             return format!("{DIM}(local backend — no API key needed){RESET}");
         }
@@ -225,6 +249,12 @@ fn current_key_summary(config: &Config) -> String {
             };
         }
         "asr-sidecar" | "asr" | "vibevoice" => {
+            // Unlike the other backends, the daemon trims both sides here and
+            // treats a blank value as absent.
+            let var = "WHISRS_ASR_SIDECAR_API_KEY";
+            if let Some(key) = env(var).filter(|key| !key.trim().is_empty()) {
+                return from_env(var, key.trim());
+            }
             return match config
                 .asr_sidecar
                 .as_ref()
@@ -235,8 +265,11 @@ fn current_key_summary(config: &Config) -> String {
                 None => format!("{DIM}(optional API key not set){RESET}"),
             };
         }
-        _ => None,
+        _ => return format!("{YELLOW}not set{RESET}"),
     };
+    if let Some(env_key) = env(var).filter(|key| !key.is_empty()) {
+        return from_env(var, &env_key);
+    }
     match key {
         Some(k) if !k.is_empty() => format!("{BOLD}{}{RESET}", setup::mask_api_key(k)),
         _ => format!("{YELLOW}not set{RESET}"),
@@ -1955,5 +1988,103 @@ api_key = "tts-SECRET-gggg"
                 "`{tail}` section is missing its masked key:\n{rendered}"
             );
         }
+    }
+
+    /// Parse `toml` and summarize its key with `env` standing in for the
+    /// process environment, which these tests never touch.
+    fn key_summary(toml: &str, env: &[(&str, &str)]) -> String {
+        let config: Config = toml::from_str(toml).expect("fixture parses");
+        current_key_summary_from(&config, |name| {
+            env.iter()
+                .find(|(var, _)| *var == name)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    /// One row per keyed backend family, including an alias of each shared
+    /// section: backend, section name, and the env var the daemon reads.
+    const KEYED_BACKENDS: &[(&str, &str, &str)] = &[
+        ("groq", "groq", "WHISRS_GROQ_API_KEY"),
+        ("deepgram", "deepgram", "WHISRS_DEEPGRAM_API_KEY"),
+        ("deepgram-streaming", "deepgram", "WHISRS_DEEPGRAM_API_KEY"),
+        ("openai", "openai", "WHISRS_OPENAI_API_KEY"),
+        ("openai-realtime", "openai", "WHISRS_OPENAI_API_KEY"),
+        ("asr-sidecar", "asr-sidecar", "WHISRS_ASR_SIDECAR_API_KEY"),
+        ("asr", "asr-sidecar", "WHISRS_ASR_SIDECAR_API_KEY"),
+        ("vibevoice", "asr-sidecar", "WHISRS_ASR_SIDECAR_API_KEY"),
+    ];
+
+    #[test]
+    fn key_summary_shows_an_env_key_without_a_config_key() {
+        for &(backend, section, var) in KEYED_BACKENDS {
+            let absent = format!("[general]\nbackend = \"{backend}\"\n");
+            let empty = format!("{absent}[{section}]\napi_key = \"\"\n");
+            for toml in [absent, empty] {
+                let summary = key_summary(&toml, &[(var, "env-key-9876")]);
+                assert!(
+                    summary.contains("****9876") && summary.contains(var),
+                    "{backend}: {summary}"
+                );
+                assert!(summary.contains("this shell"), "{backend}: {summary}");
+            }
+        }
+    }
+
+    #[test]
+    fn key_summary_prefers_the_env_key_like_the_daemon() {
+        for &(backend, section, var) in KEYED_BACKENDS {
+            let toml = format!(
+                "[general]\nbackend = \"{backend}\"\n[{section}]\napi_key = \"file-key-1234\"\n"
+            );
+            let both = key_summary(&toml, &[(var, "env-key-9876")]);
+            assert!(
+                both.contains("****9876") && both.contains(var) && !both.contains("1234"),
+                "{backend}: {both}"
+            );
+
+            let file_only = key_summary(&toml, &[]);
+            assert!(
+                file_only.contains("****1234") && !file_only.contains(var),
+                "{backend}: {file_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_summary_without_any_key_is_unchanged() {
+        for &(backend, section, var) in KEYED_BACKENDS {
+            let summary = key_summary(&format!("[general]\nbackend = \"{backend}\"\n"), &[]);
+            let expected = if section == "asr-sidecar" {
+                "(optional API key not set)"
+            } else {
+                "not set"
+            };
+            assert!(summary.contains(expected), "{backend}: {summary}");
+            assert!(!summary.contains(var), "{backend}: {summary}");
+        }
+    }
+
+    /// The daemon's blank-env rules differ by backend: groq only skips an
+    /// empty string, so whitespace counts as set, while the sidecar trims.
+    #[test]
+    fn key_summary_follows_each_backends_blank_env_rule() {
+        let groq = "[general]\nbackend = \"groq\"\n[groq]\napi_key = \"file-key-1234\"\n";
+        let empty = key_summary(groq, &[("WHISRS_GROQ_API_KEY", "")]);
+        assert!(empty.contains("****1234"), "{empty}");
+        let spaces = key_summary(groq, &[("WHISRS_GROQ_API_KEY", "     ")]);
+        assert!(spaces.contains("WHISRS_GROQ_API_KEY"), "{spaces}");
+
+        let sidecar = "[general]\nbackend = \"asr-sidecar\"\n\
+                       [asr-sidecar]\napi_key = \"file-key-1234\"\n";
+        let spaces = key_summary(sidecar, &[("WHISRS_ASR_SIDECAR_API_KEY", "   ")]);
+        assert!(
+            spaces.contains("****1234") && !spaces.contains("WHISRS_"),
+            "{spaces}"
+        );
+        let padded = key_summary(
+            sidecar,
+            &[("WHISRS_ASR_SIDECAR_API_KEY", " env-key-9876\n")],
+        );
+        assert!(padded.contains("****9876"), "{padded}");
     }
 }
