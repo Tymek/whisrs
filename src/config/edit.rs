@@ -365,8 +365,8 @@ fn edit_filler_words(config: &mut Config) -> Result<()> {
     }
 
     let input: String = Input::new()
-        .with_prompt("Comma-separated filler words (leave blank to clear)")
-        .default(config.general.filler_words.join(", "))
+        .with_prompt("Comma-separated filler words (leave blank for the built-in list)")
+        .with_initial_text(config.general.filler_words.join(", "))
         .allow_empty(true)
         .interact_text()
         .context("failed to read filler word list")?;
@@ -386,26 +386,21 @@ fn edit_vocabulary_and_prompt(config: &mut Config, use_vocab_file: bool) -> Resu
         );
     }
 
-    let current = if config.general.vocabulary.is_empty() {
-        "(empty)".to_string()
-    } else {
-        config.general.vocabulary.join(", ")
-    };
-    println!("  Current vocabulary: {current}");
-
+    // No "Current vocabulary:" line: the prompt below seeds the editable
+    // buffer with the same list, and printing it twice doubled the wrapped
+    // rows on screen — enough to push this section's header out of view for a
+    // list of any size.
     let input: String = Input::new()
         .with_prompt("Comma-separated vocabulary (leave blank to clear)")
-        .default(config.general.vocabulary.join(", "))
+        .with_initial_text(config.general.vocabulary.join(", "))
         .allow_empty(true)
         .interact_text()
         .context("failed to read vocabulary")?;
     config.general.vocabulary = parse_csv_list(&input);
 
-    let current_prompt = config.general.prompt.as_deref().unwrap_or("(none)");
-    println!("  Current prompt: {current_prompt}");
     let prompt: String = Input::new()
         .with_prompt("Free-form prompt (style/register hints; leave blank to clear)")
-        .default(config.general.prompt.clone().unwrap_or_default())
+        .with_initial_text(config.general.prompt.clone().unwrap_or_default())
         .allow_empty(true)
         .interact_text()
         .context("failed to read prompt")?;
@@ -544,13 +539,19 @@ fn any_hotkey_set(hotkeys: &HotkeyConfig) -> bool {
     toggle.is_some() || cancel.is_some() || command.is_some() || speak.is_some()
 }
 
+/// Prompt for a value that may be unset, seeded with the current one.
+///
+/// `with_initial_text` rather than `default`: it puts the current value in
+/// the editable buffer, so Enter keeps it, editing amends it in place, and a
+/// blank line genuinely unsets it. With `default` the buffer starts empty and
+/// an empty line returns the default, so the value could only be cleared by
+/// typing a space, which the label had to explain. See
+/// `every_seeded_input_prompt_lets_a_blank_line_clear_it`.
 fn prompt_optional_string(label: &str, current: &Option<String>) -> Result<Option<String>> {
-    let default = current.clone().unwrap_or_default();
+    let current = current.clone().unwrap_or_default();
     let input: String = Input::new()
-        // Enter keeps the shown default, so an existing value cannot be cleared
-        // by submitting an empty line. Type a space to unset one.
-        .with_prompt(format!("{label} (space to unset)"))
-        .default(default)
+        .with_prompt(format!("{label} (blank to unset)"))
+        .with_initial_text(current)
         .allow_empty(true)
         .interact_text()
         .with_context(|| format!("failed to read {label}"))?;
@@ -759,7 +760,7 @@ fn edit_one_llm_command(config: &mut Config) -> Result<()> {
         .context("failed to read hotkey")?;
     let set_hotkey_raw: String = Input::new()
         .with_prompt("Set-hotkey (reprogram from selection; blank for none)")
-        .default(entry.set_hotkey.clone().unwrap_or_default())
+        .with_initial_text(entry.set_hotkey.clone().unwrap_or_default())
         .allow_empty(true)
         .interact_text()
         .context("failed to read set_hotkey")?;
@@ -1157,6 +1158,71 @@ fn parse_csv_list(input: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Input::default` prints the current value as a hint but leaves the
+    /// editable buffer empty, and on an empty line it returns that default
+    /// rather than `""` — `permit_empty` is only consulted when no default is
+    /// set (dialoguer 0.11, `prompts/input.rs:575`). Pairing it with
+    /// `allow_empty(true)` is therefore a contradiction: the prompt advertises
+    /// that a blank line clears the value, and a blank line keeps it. The same
+    /// pairing is why a list could only be replaced, never amended — the
+    /// buffer the user edits starts empty (#141).
+    ///
+    /// `with_initial_text` is the pairing that works: it seeds the editable
+    /// buffer, so Enter keeps the value, typing amends it, and a blank line
+    /// really does clear it. Driven through a real 80-column pty it also
+    /// leaves one fewer orphaned row than `default` when the value wraps.
+    ///
+    /// Both directions are pinned, because the opposite slip is just as
+    /// silent: drop `allow_empty(true)` from a seeded chain and `permit_empty`
+    /// is false again, so dialoguer re-seeds the initial text and re-prompts
+    /// forever on an empty line (`prompts/input.rs:303,320-324,589`) while
+    /// the label still promises that blanking works.
+    ///
+    /// The prompting is interactive IO and cannot be unit tested, so this pins
+    /// the builder shape instead. The chain count is asserted because the
+    /// constructor needle is an exact substring: a site spelled
+    /// `Input::with_theme(..)` or `Input::<String>::new()` would drop out of
+    /// the scan with nothing noticing. Comments are stripped first — this file
+    /// explains itself inline constantly, and a comment merely naming
+    /// `.default(` would fail correct code. The needles are assembled at
+    /// runtime so the test does not match its own source.
+    #[test]
+    fn every_seeded_input_prompt_lets_a_blank_line_clear_it() {
+        let source = setup::source_without_comments(include_str!("edit.rs"));
+        let ctor = format!("Input::{}()", "new");
+        let default = format!(".{}(", "default");
+        let initial = format!(".with_{}_text(", "initial");
+        let allow_empty = format!(".{}(true)", "allow_empty");
+
+        let chains: Vec<&str> = source
+            .split(&ctor)
+            .skip(1)
+            .map(|chain| chain.split(".interact").next().unwrap())
+            .collect();
+        assert_eq!(
+            chains.len(),
+            16,
+            "the scan found {} `Input` chains, not 16. Fewer means a \
+             constructor spelling the needle misses, which makes this test \
+             vacuous; more means a prompt was added — audit its chain against \
+             the rules below, then bump this number",
+            chains.len()
+        );
+
+        for (i, chain) in chains.iter().enumerate() {
+            assert!(
+                !(chain.contains(&default) && chain.contains(&allow_empty)),
+                "Input chain {i} seeds a default and also permits an empty \
+                 line, so its blank-clears-the-value label is false:\n{chain}"
+            );
+            assert!(
+                !chain.contains(&initial) || chain.contains(&allow_empty),
+                "Input chain {i} seeds the buffer but does not permit an \
+                 empty line, so blanking it re-prompts forever:\n{chain}"
+            );
+        }
+    }
 
     /// Every field name of `[hotkeys]`, taken from serde rather than a hand-
     /// written list so a new field cannot be forgotten here too.
