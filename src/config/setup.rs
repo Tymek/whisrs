@@ -518,6 +518,7 @@ pub(crate) fn configure_backend(
                 "Deepgram API key",
                 "Get one free ($200 credit) at https://console.deepgram.com/signup",
                 existing_key,
+                "WHISRS_DEEPGRAM_API_KEY",
             )?;
             let model = existing
                 .and_then(|c| c.deepgram.as_ref())
@@ -534,6 +535,7 @@ pub(crate) fn configure_backend(
                 "Groq API key",
                 "Get one free at https://console.groq.com/keys",
                 existing_key,
+                "WHISRS_GROQ_API_KEY",
             )?;
             let model = existing
                 .and_then(|c| c.groq.as_ref())
@@ -550,6 +552,7 @@ pub(crate) fn configure_backend(
                 "OpenAI API key",
                 "Get one at https://platform.openai.com/api-keys",
                 existing_key,
+                "WHISRS_OPENAI_API_KEY",
             )?;
             let model = if backend == "openai-realtime" {
                 "gpt-realtime-whisper".to_string()
@@ -816,6 +819,7 @@ pub(crate) fn prompt_api_key_with_existing(
     prompt: &str,
     hint: &str,
     existing_key: Option<&String>,
+    env_var: &str,
 ) -> Result<String> {
     if let Some(key) = existing_key {
         if !key.is_empty() {
@@ -839,9 +843,27 @@ pub(crate) fn prompt_api_key_with_existing(
         .interact()
         .context("failed to read API key")?;
     if key.is_empty() {
-        println!("  {YELLOW}Warning: empty API key — you can set it later in config.toml{RESET}");
+        let env_set = std::env::var(env_var).is_ok_and(|v| !v.is_empty());
+        println!("  {}", empty_key_notice(env_var, env_set));
     }
     Ok(key)
+}
+
+/// What to say when the user leaves the API key blank. `env_set` follows the
+/// daemon's rule for these backends: the env var counts if it is non-empty,
+/// untrimmed. The shell having it does not mean the daemon does, so that
+/// branch says so rather than warning about a var that is already set.
+fn empty_key_notice(env_var: &str, env_set: bool) -> String {
+    if env_set {
+        format!(
+            "{DIM}No key saved; {env_var} is set in this shell. \
+             The daemon must also see it in its own environment.{RESET}"
+        )
+    } else {
+        format!(
+            "{YELLOW}Warning: empty API key — set it later in config.toml or via {env_var}{RESET}"
+        )
+    }
 }
 
 pub(crate) fn prompt_optional_api_key_with_existing(
@@ -4250,6 +4272,27 @@ stray = "keep me"
         assert!(
             unreadable_at < wizard_at,
             "the refusal must come before the wizard prompts"
+        );
+    }
+
+    /// A blank key with the env var already set must not tell the user to go
+    /// set that var, and must not imply the daemon can see it.
+    #[test]
+    fn empty_key_notice_knows_when_the_env_var_is_set() {
+        let set = empty_key_notice("WHISRS_GROQ_API_KEY", true);
+        assert!(
+            set.contains("WHISRS_GROQ_API_KEY is set in this shell")
+                && set.contains("daemon must also see it")
+                && !set.contains("Warning"),
+            "{set}"
+        );
+
+        let unset = empty_key_notice("WHISRS_GROQ_API_KEY", false);
+        assert!(
+            unset.contains("Warning: empty API key")
+                && unset.contains("or via WHISRS_GROQ_API_KEY")
+                && !unset.contains("this shell"),
+            "{unset}"
         );
     }
 }
