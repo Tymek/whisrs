@@ -63,6 +63,10 @@ jobs:
             features: ""
           - name: minimal (no local-whisper)
             features: "--no-default-features --features tray,overlay,hooks"
+    # Same CPU baseline as the x86_64 rows of release.yml, so a regression
+    # fails the PR instead of the tag (#152).
+    env:
+      GGML_NATIVE: "OFF"
     steps:
       - uses: actions/checkout@v4
 
@@ -72,6 +76,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          env-vars: GGML
 
       - name: Release build
         run: cargo build --release ${{ matrix.features }}
+
+      - name: Check for AVX-512 instructions
+        run: scripts/check-no-avx512.sh
