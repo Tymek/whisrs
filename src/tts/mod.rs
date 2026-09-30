@@ -41,12 +41,55 @@ const SIDECAR_DEFAULT_VOICE: &str = "af_heart";
 
 /// Trait for text-to-speech backends.
 ///
-/// Each backend takes input text and returns synthesized speech as WAV bytes,
-/// ready to be decoded and played by [`crate::audio::playback::play_wav`].
+/// Each backend takes input text and returns the synthesized speech as a
+/// [`TtsAudioStream`] of WAV bytes, so playback
+/// ([`crate::audio::playback::play_wav_stream`]) can start on the first chunk
+/// instead of waiting for the whole clip.
 #[async_trait]
 pub trait TtsBackend: Send + Sync {
-    /// Synthesize `text` into speech, returning WAV-encoded audio bytes.
-    async fn synthesize(&self, text: &str) -> Result<Vec<u8>, WhisrsError>;
+    /// Start synthesizing `text` into speech.
+    ///
+    /// Returns once the response headers arrive. Request failures, non-2xx
+    /// statuses and empty input are reported here, before any audio; the
+    /// WAV body is then read chunk by chunk from the returned stream.
+    async fn synthesize(&self, text: &str) -> Result<Box<dyn TtsAudioStream>, WhisrsError>;
+}
+
+/// A synthesized WAV body, read incrementally as the backend produces it.
+///
+/// Chunks are split at arbitrary byte offsets (not at sample or header
+/// boundaries); concatenated, they form the complete WAV file.
+#[async_trait]
+pub trait TtsAudioStream: Send {
+    /// The next chunk of the body, or `Ok(None)` once the body has ended.
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, WhisrsError>;
+}
+
+/// [`TtsAudioStream`] over an HTTP response body.
+pub(crate) struct HttpAudioStream {
+    response: reqwest::Response,
+    /// Error prefix for a failed body read (e.g. `"TTS"`, `"Deepgram TTS"`).
+    label: &'static str,
+}
+
+impl HttpAudioStream {
+    pub(crate) fn new(response: reqwest::Response, label: &'static str) -> Self {
+        Self { response, label }
+    }
+}
+
+#[async_trait]
+impl TtsAudioStream for HttpAudioStream {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, WhisrsError> {
+        match self.response.chunk().await {
+            Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(WhisrsError::Transcription(format!(
+                "{} read body failed: {e}",
+                self.label
+            ))),
+        }
+    }
 }
 
 /// Build the configured TTS backend.
@@ -116,13 +159,19 @@ pub fn create_backend(
                 .filter(|s| !s.is_empty())
                 .unwrap_or(DEFAULT_SIDECAR_URL)
                 .to_string();
-            Ok(Box::new(openai_compat::OpenAiCompatTts::new(
-                base_url,
-                api_key, // optional — sidecars usually need none
-                model_or(SIDECAR_DEFAULT_MODEL),
-                voice_or(SIDECAR_DEFAULT_VOICE),
-                config.response_format.clone(),
-            )))
+            // `stream: true` asks the sidecar for a chunked body. Pocket TTS
+            // OpenAI wrappers default to returning the whole clip at once;
+            // Kokoro-FastAPI already streams by default.
+            Ok(Box::new(
+                openai_compat::OpenAiCompatTts::new(
+                    base_url,
+                    api_key, // optional — sidecars usually need none
+                    model_or(SIDECAR_DEFAULT_MODEL),
+                    voice_or(SIDECAR_DEFAULT_VOICE),
+                    config.response_format.clone(),
+                )
+                .with_stream_flag(),
+            ))
         }
         // `[tts] voice` is intentionally not passed here: Aura encodes the
         // voice in the model id (e.g. `aura-2-thalia-en`), so the model alone
@@ -134,6 +183,74 @@ pub fn create_backend(
         other => Err(WhisrsError::Config(format!(
             "Unknown TTS backend '{other}'. Valid options: groq, openai, tts-sidecar, deepgram"
         ))),
+    }
+}
+
+/// Hand-rolled one-connection HTTP server pieces for exercising the backends
+/// against real sockets (mirrors `serve_once` in the asr-sidecar tests).
+#[cfg(test)]
+pub(crate) mod test_server {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Accept one connection and read the whole request. Returns the open
+    /// connection (for the test to answer on) and the request body.
+    pub(crate) async fn accept_request(listener: &TcpListener) -> (TcpStream, String) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "client closed before sending a request head");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+        let content_length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("a JSON request body carries content-length");
+        // Drain the body before replying, or the reply surfaces as a reset.
+        while buf.len() < head_end + content_length {
+            let n = stream.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let body = String::from_utf8_lossy(&buf[head_end..]).into_owned();
+        (stream, body)
+    }
+
+    /// Start a `200 OK` response with a chunked body.
+    pub(crate) async fn write_chunked_head(stream: &mut TcpStream) {
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: audio/wav\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    /// Write and flush one body chunk in chunked transfer encoding.
+    pub(crate) async fn write_chunk(stream: &mut TcpStream, data: &[u8]) {
+        stream
+            .write_all(format!("{:x}\r\n", data.len()).as_bytes())
+            .await
+            .unwrap();
+        stream.write_all(data).await.unwrap();
+        stream.write_all(b"\r\n").await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    /// Terminate a chunked body.
+    pub(crate) async fn finish_chunked(stream: &mut TcpStream) {
+        stream.write_all(b"0\r\n\r\n").await.unwrap();
+        stream.flush().await.unwrap();
     }
 }
 
@@ -181,5 +298,38 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("Unknown TTS backend")),
             Ok(_) => panic!("expected an error for an unknown backend"),
         }
+    }
+
+    /// The sidecar branch of `create_backend` must put `"stream": true` on the
+    /// wire; checked through a real request so the builder call can't be lost.
+    #[tokio::test]
+    async fn sidecar_backend_sends_stream_flag() {
+        use test_server::*;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, body) = accept_request(&listener).await;
+            write_chunked_head(&mut stream).await;
+            write_chunk(&mut stream, b"RIFF").await;
+            finish_chunked(&mut stream).await;
+            body
+        });
+
+        let config = TtsConfig {
+            url: Some(format!("http://{addr}/v1/audio/speech")),
+            ..cfg("tts-sidecar")
+        };
+        let Ok(backend) = create_backend(&config, None) else {
+            panic!("sidecar backend must build");
+        };
+        let mut audio = match backend.synthesize("hi").await {
+            Ok(audio) => audio,
+            Err(e) => panic!("expected a 200 response: {e}"),
+        };
+        while audio.next_chunk().await.unwrap().is_some() {}
+
+        let body: serde_json::Value = serde_json::from_str(&server.await.unwrap()).unwrap();
+        assert_eq!(body["stream"], true, "sidecar request body: {body}");
     }
 }

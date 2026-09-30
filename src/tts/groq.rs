@@ -40,7 +40,11 @@ mod tests {
             "autumn".to_string(),
             "wav".to_string(),
         );
-        let err = backend.synthesize("   ").await.unwrap_err();
+        let err = backend
+            .synthesize("   ")
+            .await
+            .err()
+            .expect("empty text must fail");
         assert!(err.to_string().contains("empty text"));
     }
 }
