@@ -13,7 +13,8 @@ use whisrs::{Config, Response, State};
 
 use crate::context::{CommandModeContext, DaemonContext, DaemonState, LlmCommandContext};
 use crate::injection::{
-    clear_line_via_keyboard, inject_text, is_terminal_class, prepare_llm_injection, LlmInjection,
+    clear_line_and_inject, inject_text, is_terminal_class, notify_copied_for_held_modifier,
+    prepare_llm_injection, Injection, KeystrokeSettings, LlmInjection,
 };
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
@@ -481,31 +482,37 @@ async fn command_mode_background_inner(
     // `[input] clipboard_only` skips the clear: nothing is injected in that
     // mode, so clearing would wipe whatever the user had typed at the prompt
     // and put nothing in its place — destroying input to produce no output.
+    //
+    // A physical modifier still held after `[input] modifier_wait_ms` (#154)
+    // withholds the clear *and* the injection: the rewrite is copied to the
+    // clipboard instead (see `clear_line_and_inject`).
     info!("command mode: injecting {} chars", result.len());
     let text_clone = result.clone();
-    let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
-    let injector_backend = context.config.input.backend;
+    let keys = KeystrokeSettings::from_config(&context.config.input);
     let paste = context.config.input.paste;
     let clipboard_fallback = context.config.input.clipboard_fallback;
     match tokio::task::spawn_blocking(move || {
         if is_terminal && !clipboard_only {
-            if let Err(e) = clear_line_via_keyboard(key_delay, injector_backend) {
-                warn!("command mode: failed to clear terminal line, injecting anyway: {e:#}");
-            }
+            clear_line_and_inject(&text_clone, keys, paste, clipboard_fallback)
+        } else {
+            inject_text(
+                &text_clone,
+                is_terminal,
+                keys,
+                paste,
+                clipboard_fallback,
+                clipboard_only,
+            )
         }
-        inject_text(
-            &text_clone,
-            is_terminal,
-            key_delay,
-            injector_backend,
-            paste,
-            clipboard_fallback,
-            clipboard_only,
-        )
     })
     .await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(Injection::Delivered)) => {}
+        Ok(Ok(Injection::CopiedForHeldModifier)) => {
+            if context.notify_error() {
+                notify_copied_for_held_modifier(&result);
+            }
+        }
         Ok(Err(e)) => warn!("command mode: failed to inject text: {e:#}"),
         Err(e) => warn!("command mode: injection task panicked: {e}"),
     }
@@ -967,16 +974,14 @@ async fn llm_command_background_inner(
     // Inject at the cursor — keystrokes, or clipboard paste when
     // `[input] paste = true` (layout-independent).
     let result_clone = result.clone();
-    let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
-    let injector_backend = context.config.input.backend;
+    let keys = KeystrokeSettings::from_config(&context.config.input);
     let paste = context.config.input.paste;
     let clipboard_fallback = context.config.input.clipboard_fallback;
     match tokio::task::spawn_blocking(move || {
         inject_text(
             &result_clone,
             is_terminal,
-            key_delay,
-            injector_backend,
+            keys,
             paste,
             clipboard_fallback,
             clipboard_only,
@@ -984,7 +989,12 @@ async fn llm_command_background_inner(
     })
     .await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(Injection::Delivered)) => {}
+        Ok(Ok(Injection::CopiedForHeldModifier)) => {
+            if context.notify_error() {
+                notify_copied_for_held_modifier(&result);
+            }
+        }
         Ok(Err(e)) => warn!(
             "llm-command '{}': failed to inject text: {e:#}",
             cmd_ctx.name
@@ -1225,6 +1235,10 @@ mod tests {
             (
                 CaptureError::ClipboardUnchanged,
                 "no text selected — select some text first",
+            ),
+            (
+                CaptureError::ModifierHeld,
+                "a modifier key was held, so the selection was not copied",
             ),
             (
                 CaptureError::CopyFailed("uinput permission denied".to_string()),

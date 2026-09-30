@@ -100,7 +100,7 @@ pub fn run_config_menu() -> Result<()> {
             "Filler words",
             "Vocabulary & prompt",
             "Audio device",
-            "Keyboard injection (key delay)",
+            "Keyboard injection (key delay, modifier wait)",
             "Clipboard fallback (copy transcript to clipboard)",
             "Clipboard-only mode (no injection)",
             "Hotkeys",
@@ -492,6 +492,24 @@ fn edit_key_delay(config: &mut Config) -> Result<()> {
         config.input.key_delay_ms = v;
     } else {
         println!("  {YELLOW}Not a number — left unchanged.{RESET}");
+    }
+
+    println!(
+        "\n  {DIM}How long to wait for held Super/Alt/Ctrl/Shift keys to be released \
+         before typing, with batch backends and in command mode. Still held after \
+         this, the text is copied to the clipboard instead. 0 = don't wait: if a \
+         modifier is held, the text goes straight to the clipboard. Streaming \
+         backends always wait for the release.{RESET}"
+    );
+    let input: String = Input::new()
+        .with_prompt("modifier_wait_ms")
+        .default(config.input.modifier_wait_ms.to_string())
+        .interact_text()
+        .context("failed to read modifier wait")?;
+    if let Ok(v) = input.parse::<u64>() {
+        config.input.modifier_wait_ms = v;
+    } else {
+        println!("  {YELLOW}Not a number, left unchanged.{RESET}");
     }
     Ok(())
 }
@@ -1235,8 +1253,8 @@ mod tests {
             .collect();
         assert_eq!(
             chains.len(),
-            16,
-            "the scan found {} `Input` chains, not 16. Fewer means a \
+            17,
+            "the scan found {} `Input` chains, not 17. Fewer means a \
              constructor spelling the needle misses, which makes this test \
              vacuous; more means a prompt was added — audit its chain against \
              the rules below, then bump this number",

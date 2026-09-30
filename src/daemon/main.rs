@@ -28,7 +28,7 @@ use crate::command_mode::{handle_command_mode, handle_llm_command, handle_set_ll
 use crate::context::{DaemonContext, DaemonState};
 use crate::dictation::{handle_cancel, handle_toggle};
 use crate::factory::create_backend;
-use crate::injection::warm_keyboard;
+use crate::injection::{prime_modifier_probe, warm_keyboard};
 use crate::notify::send_notification;
 use crate::speak::handle_speak;
 #[cfg(feature = "hooks")]
@@ -82,6 +82,11 @@ async fn main() -> Result<()> {
         std::time::Duration::from_millis(config.input.key_delay_ms),
         config.input.backend,
     );
+    // Open the keyboards the pre-injection modifier check reads (#154) now,
+    // off the hot path, so the first dictation does not pay for it. Always:
+    // selection capture (speak, command) checks modifiers even when
+    // clipboard_only skips typing.
+    tokio::task::spawn_blocking(prime_modifier_probe);
 
     // Check D-Bus session bus if MPRIS media pause is configured.
     #[cfg(feature = "hooks")]
