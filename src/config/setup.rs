@@ -19,6 +19,7 @@ use crate::service::{ServiceManager, OPENRC_SERVICE, SYSTEMD_UNIT};
 use crate::{
     AsrSidecarConfig, AudioConfig, Config, DeepgramConfig, GeneralConfig, GroqConfig,
     InjectorBackend, InputConfig, LocalWhisperConfig, OpenAiCompatibleRealtimeConfig, OpenAiConfig,
+    RestartOutcome,
 };
 
 // ANSI color codes.
@@ -1690,6 +1691,12 @@ fn setup_user_service() {
             dest.display()
         );
         if manager.service_installed() && manager.is_active() {
+            // Running is not the same as running the right binary: after a
+            // switch from a package to `cargo install`, the unit still points
+            // at the old whisrsd (issue #146).
+            if manager == ServiceManager::Systemd && offer_repoint(manager, &dest) {
+                return;
+            }
             println!("  {GREEN}Service is already enabled and running{RESET}");
             return;
         }
@@ -1754,6 +1761,93 @@ fn setup_user_service() {
     }
 }
 
+/// Offer to repoint an installed systemd unit whose `ExecStart=` runs a
+/// different whisrsd than the one installed now.
+///
+/// Returns false when there is nothing to offer (unit unreadable, no
+/// `ExecStart=`, or already pointing at the resolved binary), so the caller
+/// falls through to its usual "already running" message. Rewrites the unit in
+/// place rather than re-copying `contrib/`, so the user's own edits survive.
+fn offer_repoint(manager: ServiceManager, dest: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(dest) else {
+        return false;
+    };
+    let Some(current) = exec_start_binary(&contents) else {
+        return false;
+    };
+    let resolved = which_whisrsd();
+    let home = dirs::home_dir();
+    if !unit_needs_repoint(
+        current,
+        Path::new(&resolved),
+        home.as_deref(),
+        &systemd_search_path(),
+    ) {
+        return false;
+    }
+
+    println!("  {YELLOW}The service runs a different whisrsd than the one installed now:{RESET}");
+    println!("    service:   {current}");
+    println!("    installed: {resolved}");
+
+    let choice = Select::new()
+        .with_prompt(format!("Repoint the service at {resolved}?"))
+        .items(&["Yes", "No"])
+        .default(0)
+        .interact();
+
+    if !matches!(choice, Ok(0)) {
+        // Not a `sed` one-liner: replacing the whole line drops arguments and
+        // execution prefixes, which is what `rewrite_exec_start` avoids.
+        println!(
+            "  {DIM}You can repoint it later: edit the ExecStart= line in {} \
+             to point at {resolved} (or re-run `whisrs setup`), then run:{RESET}",
+            dest.display()
+        );
+        println!("    systemctl --user daemon-reload");
+        if let Some(restart) = manager.restart_hint() {
+            println!("    {restart}");
+        }
+        return true;
+    }
+
+    if let Err(e) = fs::write(dest, rewrite_exec_start(&contents, &resolved)) {
+        println!("  {RED}Failed to write service file: {e}{RESET}");
+        return true;
+    }
+    println!("  {GREEN}Repointed service at {resolved}{RESET}");
+
+    // Restarting without a successful reload would start the old ExecStart
+    // again, and report success while doing it.
+    let reloaded = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !reloaded {
+        println!(
+            "  {RED}The service file was updated, but `systemctl --user daemon-reload` \
+             failed, so the service still runs the old binary. Run:{RESET}"
+        );
+        println!("    systemctl --user daemon-reload");
+        if let Some(restart) = manager.restart_hint() {
+            println!("    {restart}");
+        }
+        return true;
+    }
+    match manager.restart() {
+        RestartOutcome::Restarted => {
+            println!("  {GREEN}Service restarted{RESET}");
+        }
+        RestartOutcome::Failed | RestartOutcome::NoService => {
+            println!("  {YELLOW}Failed to restart the service, you can do it manually:{RESET}");
+            if let Some(restart) = manager.restart_hint() {
+                println!("    {restart}");
+            }
+        }
+    }
+    true
+}
+
 /// Repoint a systemd unit's `ExecStart=` at `whisrsd_path`, leaving the rest
 /// of the file alone.
 ///
@@ -1770,21 +1864,13 @@ fn setup_user_service() {
 fn rewrite_exec_start(contents: &str, whisrsd_path: &str) -> String {
     let mut out = String::with_capacity(contents.len() + whisrsd_path.len());
     for line in contents.lines() {
-        match line.strip_prefix("ExecStart=") {
-            Some(command) => {
-                // systemd strips whitespace around the value, so `ExecStart= x`
-                // names the binary `x`. Splitting before trimming would re-emit
-                // that name as an argument to the path we just resolved.
-                let command = command.trim_start();
-                let prefixes: &[char] = &['@', '-', ':', '+', '!'];
-                let binary = command.trim_start_matches(prefixes);
-                let prefix = &command[..command.len() - binary.len()];
-
+        match parse_exec_start(line) {
+            Some((prefix, _, args)) => {
                 out.push_str("ExecStart=");
                 out.push_str(prefix);
                 out.push_str(whisrsd_path);
                 // Everything after the binary is the caller's, keep it verbatim.
-                if let Some((_, args)) = binary.split_once(char::is_whitespace) {
+                if let Some(args) = args {
                     out.push(' ');
                     out.push_str(args);
                 }
@@ -1794,6 +1880,148 @@ fn rewrite_exec_start(contents: &str, whisrsd_path: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Split an `ExecStart=` line into (execution prefixes, binary, arguments).
+///
+/// Shared by [`rewrite_exec_start`] and [`exec_start_binary`] so the reader
+/// and the writer cannot disagree about which token is the binary. `None` for
+/// any other line, including `ExecStartPre=`/`ExecStartPost=`: their name is
+/// not followed by `=`, so the prefix strip already rejects them.
+fn parse_exec_start(line: &str) -> Option<(&str, &str, Option<&str>)> {
+    let command = line.strip_prefix("ExecStart=")?;
+    // systemd strips whitespace around the value, so `ExecStart= x` names the
+    // binary `x`. Splitting before trimming would re-emit that name as an
+    // argument to the path we just resolved.
+    let command = command.trim_start();
+    let prefixes: &[char] = &['@', '-', ':', '+', '!'];
+    let rest = command.trim_start_matches(prefixes);
+    let prefix = &command[..command.len() - rest.len()];
+    Some(match rest.split_once(char::is_whitespace) {
+        Some((binary, args)) => (prefix, binary, Some(args)),
+        None => (prefix, rest, None),
+    })
+}
+
+/// The binary a systemd unit's first `ExecStart=` runs, without prefixes or
+/// arguments. `None` when the unit has no `ExecStart=` or it names nothing.
+fn exec_start_binary(contents: &str) -> Option<&str> {
+    let (_, binary, _) = contents.lines().find_map(parse_exec_start)?;
+    (!binary.is_empty()).then_some(binary)
+}
+
+/// Whether a unit running `unit_binary` should be repointed at `resolved`.
+///
+/// Never repoints at a path that does not exist: `which_whisrsd` falls back
+/// to `~/.cargo/bin/whisrsd` without checking it, and swapping a working
+/// unit for a missing binary would break it. Paths are compared after
+/// canonicalizing, because a plain string compare flags `/bin/whisrsd`
+/// against `/usr/bin/whisrsd` on distros where `/bin` is a symlink.
+///
+/// Never repoints at a relative path either: `which` prints `./whisrsd` for a
+/// relative PATH entry, and a relative ExecStart breaks the unit.
+///
+/// `home` expands `%h` in the unit token; a token with any other specifier is
+/// left alone, since it cannot be resolved reliably here. A bare name is
+/// looked up in `search_path`, systemd's own binary search path (see
+/// [`systemd_search_path`]), not the user's PATH.
+fn unit_needs_repoint(
+    unit_binary: &str,
+    resolved: &Path,
+    home: Option<&Path>,
+    search_path: &[PathBuf],
+) -> bool {
+    if !resolved.is_absolute() {
+        return false;
+    }
+    // Quoting and escapes can put spaces inside the binary, which the
+    // whitespace split in `parse_exec_start` cannot see, and a rewrite would
+    // leave an unbalanced quote. Leave such a unit alone.
+    if unit_binary.starts_with(['"', '\'']) || unit_binary.contains('\\') {
+        return false;
+    }
+    let Ok(resolved) = fs::canonicalize(resolved) else {
+        return false;
+    };
+    let unit_binary = if unit_binary.contains('%') {
+        let Some(home) = home else {
+            return false;
+        };
+        match expand_unit_specifiers(unit_binary, home) {
+            Some(expanded) => PathBuf::from(expanded),
+            None => return false,
+        }
+    } else {
+        PathBuf::from(unit_binary)
+    };
+    let current = if unit_binary.is_absolute() {
+        unit_binary
+    } else if unit_binary.components().count() == 1 {
+        // A bare name: systemd takes the first search dir that has it. Found
+        // nowhere means the unit cannot start as written.
+        match search_path
+            .iter()
+            .map(|dir| dir.join(&unit_binary))
+            .find(|candidate| candidate.exists())
+        {
+            Some(found) => found,
+            None => return true,
+        }
+    } else {
+        // A relative path with a directory is not valid in ExecStart.
+        return true;
+    };
+    // A unit binary that no longer exists (uninstalled package) is stale.
+    match fs::canonicalize(current) {
+        Ok(current) => current != resolved,
+        Err(_) => true,
+    }
+}
+
+/// Expand the systemd specifiers setup can resolve in an `ExecStart=` token:
+/// `%h` (the user's home) and `%%` (a literal `%`).
+///
+/// `None` when any other specifier is present, including a trailing lone `%`,
+/// so the caller can leave a unit it does not fully understand alone.
+fn expand_unit_specifiers(token: &str, home: &Path) -> Option<String> {
+    let mut out = String::with_capacity(token.len());
+    let mut chars = token.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('h') => out.push_str(home.to_str()?),
+            Some('%') => out.push('%'),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The directories systemd searches for a bare `ExecStart=` name.
+///
+/// Asks `systemd-path search-binaries-default`, falling back to the usual
+/// compiled-in default when that fails. This is deliberately not the user's
+/// PATH: the service manager never sees it.
+fn systemd_search_path() -> Vec<PathBuf> {
+    const FALLBACK: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin";
+    let output = std::process::Command::new("systemd-path")
+        .arg("search-binaries-default")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    output
+        .as_deref()
+        .unwrap_or(FALLBACK)
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// Write the service definition for `manager` to `dest`.
@@ -2762,6 +2990,240 @@ mod tests {
             original.lines().count(),
             rewritten.lines().count(),
             "the rewrite added or dropped a line"
+        );
+    }
+
+    /// The reader behind the issue #146 repoint check must pick the same
+    /// token the rewrite replaces, or setup would offer a repoint it then
+    /// applies to a different part of the line.
+    #[test]
+    fn exec_start_binary_reads_plain_and_argument_forms() {
+        assert_eq!(
+            exec_start_binary("[Service]\nExecStart=/usr/bin/whisrsd\n"),
+            Some("/usr/bin/whisrsd")
+        );
+        assert_eq!(
+            exec_start_binary("ExecStart=/usr/bin/whisrsd --foo bar\n"),
+            Some("/usr/bin/whisrsd")
+        );
+        assert_eq!(
+            exec_start_binary("ExecStart=/usr/bin/whisrsd\t--foo\n"),
+            Some("/usr/bin/whisrsd")
+        );
+    }
+
+    #[test]
+    fn exec_start_binary_strips_prefixes_and_leading_whitespace() {
+        for line in [
+            "ExecStart=@/usr/bin/whisrsd argv0",
+            "ExecStart=-/usr/bin/whisrsd",
+            "ExecStart=:/usr/bin/whisrsd",
+            "ExecStart=+/usr/bin/whisrsd",
+            "ExecStart=!/usr/bin/whisrsd",
+            "ExecStart=-@/usr/bin/whisrsd argv0",
+            "ExecStart=  /usr/bin/whisrsd --foo",
+        ] {
+            assert_eq!(exec_start_binary(line), Some("/usr/bin/whisrsd"), "{line}");
+        }
+    }
+
+    #[test]
+    fn exec_start_binary_is_none_without_an_exec_start() {
+        assert_eq!(exec_start_binary("[Service]\nRestart=on-failure\n"), None);
+        assert_eq!(
+            exec_start_binary("ExecStartPre=/bin/true\nExecStartPost=/bin/true\n"),
+            None
+        );
+        assert_eq!(exec_start_binary("ExecStart=\n"), None);
+        assert_eq!(exec_start_binary("ExecStart=  \n"), None);
+    }
+
+    #[test]
+    fn exec_start_binary_reads_the_shipped_unit() {
+        let src = find_contrib_file("whisrs.service").expect("contrib/whisrs.service is on disk");
+        let unit = std::fs::read_to_string(&src).expect("contrib unit is readable");
+        assert_eq!(exec_start_binary(&unit), Some("whisrsd"));
+    }
+
+    /// Two real files plus a symlink to one of them, in a scratch dir.
+    fn repoint_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a-whisrsd");
+        let b = dir.path().join("b-whisrsd");
+        let link = dir.path().join("link-whisrsd");
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        (dir, a, b, link)
+    }
+
+    /// `unit_needs_repoint` with no home and an empty search path, so nothing
+    /// on the host can leak into the result.
+    fn needs_repoint(unit_binary: &str, resolved: &Path) -> bool {
+        unit_needs_repoint(unit_binary, resolved, None, &[])
+    }
+
+    #[test]
+    fn unit_needs_repoint_compares_resolved_files() {
+        let (_dir, a, b, link) = repoint_fixture();
+        let a_str = a.to_str().unwrap();
+        assert!(!needs_repoint(a_str, &a), "same path");
+        assert!(needs_repoint(a_str, &b), "different existing file");
+        // `/bin` -> `/usr/bin` on Arch: a string compare would flag this.
+        assert!(
+            !needs_repoint(link.to_str().unwrap(), &a),
+            "symlink to the same file"
+        );
+    }
+
+    /// `which_whisrsd` falls back to `~/.cargo/bin/whisrsd` without checking
+    /// it exists, so a missing resolved path must never trigger a repoint.
+    #[test]
+    fn unit_needs_repoint_never_points_at_a_missing_binary() {
+        let (dir, a, _b, _link) = repoint_fixture();
+        let missing = dir.path().join("missing-whisrsd");
+        assert!(!needs_repoint(a.to_str().unwrap(), &missing));
+        assert!(!needs_repoint("whisrsd", &missing));
+        assert!(!unit_needs_repoint(
+            "whisrsd",
+            &missing,
+            Some(dir.path()),
+            &[dir.path().to_path_buf()]
+        ));
+    }
+
+    #[test]
+    fn unit_needs_repoint_flags_bare_and_deleted_unit_binaries() {
+        let (dir, a, _b, _link) = repoint_fixture();
+        assert!(needs_repoint("whisrsd", &a), "bare name found nowhere");
+        let gone = dir.path().join("uninstalled-whisrsd");
+        assert!(
+            needs_repoint(gone.to_str().unwrap(), &a),
+            "unit binary that no longer exists"
+        );
+    }
+
+    /// The maintainer's live unit is `ExecStart=%h/.cargo/bin/whisrsd` and
+    /// `which whisrsd` is that same file. Treating `%h/...` as a bare name
+    /// prompted to repoint the unit at the binary it already runs.
+    #[test]
+    fn unit_needs_repoint_skips_percent_h_unit_already_on_the_cargo_binary() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".cargo/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let whisrsd = bin.join("whisrsd");
+        std::fs::write(&whisrsd, "").unwrap();
+        assert!(!unit_needs_repoint(
+            "%h/.cargo/bin/whisrsd",
+            &whisrsd,
+            Some(home.path()),
+            &[]
+        ));
+        // Without a home, `%h` cannot be resolved, so leave the unit alone.
+        assert!(!unit_needs_repoint(
+            "%h/.cargo/bin/whisrsd",
+            &whisrsd,
+            None,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn unit_needs_repoint_flags_percent_h_unit_on_another_binary() {
+        let (dir, _a, b, _link) = repoint_fixture();
+        std::fs::write(dir.path().join("whisrsd"), "").unwrap();
+        assert!(unit_needs_repoint("%h/whisrsd", &b, Some(dir.path()), &[]));
+    }
+
+    #[test]
+    fn unit_needs_repoint_leaves_unsupported_specifiers_alone() {
+        let (dir, _a, b, _link) = repoint_fixture();
+        assert!(!unit_needs_repoint("%U/whisrsd", &b, Some(dir.path()), &[]));
+    }
+
+    /// systemd resolves a bare `ExecStart=whisrsd` against its own search
+    /// path, so a bare name that lands on the resolved binary is fine.
+    #[test]
+    fn unit_needs_repoint_resolves_bare_name_against_search_path() {
+        let search = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let found = search.path().join("whisrsd");
+        std::fs::write(&found, "").unwrap();
+        let dirs = [empty.path().to_path_buf(), search.path().to_path_buf()];
+        assert!(
+            !unit_needs_repoint("whisrsd", &found, None, &dirs),
+            "bare name found in a search dir, same file"
+        );
+
+        let (_other, a, _b, _link) = repoint_fixture();
+        assert!(
+            unit_needs_repoint("whisrsd", &a, None, &dirs),
+            "bare name found in a search dir, different file"
+        );
+        assert!(
+            unit_needs_repoint("whisrsd", &found, None, &[empty.path().to_path_buf()]),
+            "bare name found nowhere"
+        );
+    }
+
+    /// The first search dir that has the name wins, as in systemd.
+    #[test]
+    fn unit_needs_repoint_takes_the_first_search_dir_hit() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("whisrsd"), "").unwrap();
+        let later = second.path().join("whisrsd");
+        std::fs::write(&later, "").unwrap();
+        let dirs = [first.path().to_path_buf(), second.path().to_path_buf()];
+        assert!(unit_needs_repoint("whisrsd", &later, None, &dirs));
+    }
+
+    /// A quoted binary can hold spaces the whitespace split cannot see, so
+    /// rewriting it would leave an unbalanced quote.
+    #[test]
+    fn unit_needs_repoint_leaves_quoted_and_escaped_binaries_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = dir.path().join("whisrsd");
+        fs::write(&resolved, "").unwrap();
+        assert!(!needs_repoint("\"/opt/my", &resolved));
+        assert!(!needs_repoint("'/opt/my", &resolved));
+        assert!(!needs_repoint("/opt/my\\x20apps/whisrsd", &resolved));
+    }
+
+    /// `which` prints `./whisrsd` for a relative PATH entry; writing that into
+    /// ExecStart would break the unit.
+    #[test]
+    fn unit_needs_repoint_never_points_at_a_relative_path() {
+        let (_dir, a, _b, _link) = repoint_fixture();
+        assert!(!needs_repoint(a.to_str().unwrap(), Path::new("./whisrsd")));
+        assert!(!needs_repoint("whisrsd", Path::new("whisrsd")));
+    }
+
+    #[test]
+    fn expand_unit_specifiers_handles_home_and_literal_percent() {
+        let home = tempfile::tempdir().unwrap();
+        let expected = format!("{}/.cargo/bin/whisrsd", home.path().display());
+        assert_eq!(
+            expand_unit_specifiers("%h/.cargo/bin/whisrsd", home.path()),
+            Some(expected)
+        );
+        assert_eq!(
+            expand_unit_specifiers("/opt/100%%/whisrsd", home.path()),
+            Some("/opt/100%/whisrsd".to_string())
+        );
+        assert_eq!(
+            expand_unit_specifiers("/usr/bin/whisrsd", home.path()),
+            Some("/usr/bin/whisrsd".to_string())
+        );
+    }
+
+    #[test]
+    fn expand_unit_specifiers_rejects_unsupported_specifiers() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(expand_unit_specifiers("%U/x", home.path()), None);
+        assert_eq!(
+            expand_unit_specifiers("/usr/bin/whisrsd%", home.path()),
+            None
         );
     }
 
