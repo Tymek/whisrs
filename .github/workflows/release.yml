@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+  # Manual runs build and check every artifact but never publish a release.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -19,18 +21,22 @@ jobs:
       matrix:
         include:
           - name: Linux x86_64
+            arch: x86_64
             runner: ubuntu-latest
             artifact: whisrs-linux-x86_64
             features: ""
           - name: Linux x86_64 (no local-whisper)
+            arch: x86_64
             runner: ubuntu-latest
             artifact: whisrs-linux-x86_64-minimal
             features: "--no-default-features --features tray,overlay,hooks"
           - name: Linux aarch64
+            arch: aarch64
             runner: ubuntu-24.04-arm
             artifact: whisrs-linux-aarch64
             features: ""
           - name: Linux aarch64 (no local-whisper)
+            arch: aarch64
             runner: ubuntu-24.04-arm
             artifact: whisrs-linux-aarch64-minimal
             features: "--no-default-features --features tray,overlay,hooks"
@@ -43,10 +49,27 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # ggml defaults to -march=native, so an unpinned build inherits the runner's
+      # ISA (v0.1.26 shipped AVX-512, #150). OFF gives an x86-64-v3 floor
+      # (AVX2/BMI2/FMA/F16C, no AVX-512).
+      # Set only on x86_64: whisper-rs-sys forwards every GGML_* var to cmake, and
+      # an empty value would read as OFF on the ARM rows too.
+      - name: Pin x86_64 CPU baseline
+        if: matrix.arch == 'x86_64'
+        run: echo "GGML_NATIVE=OFF" >> "$GITHUB_ENV"
+
+      # whisper-rs-sys never reruns on GGML_* changes, so key the cache on them
+      # or a restored target/ keeps the old ggml build.
       - uses: Swatinem/rust-cache@v2
+        with:
+          env-vars: GGML
 
       - name: Build
         run: cargo build --release ${{ matrix.features }}
+
+      - name: Check for AVX-512 instructions
+        if: matrix.arch == 'x86_64'
+        run: scripts/check-no-avx512.sh
 
       - name: Package
         run: |
@@ -67,6 +90,8 @@ jobs:
   release:
     name: Create Release
     needs: build
+    # Tag pushes only: a manual run started from a tag must not re-upload assets.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
