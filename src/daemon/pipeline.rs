@@ -16,12 +16,15 @@ use whisrs::llm;
 use whisrs::state::Action;
 use whisrs::transcription::{TranscriptionBackend, TranscriptionConfig};
 use whisrs::window::WindowTracker;
-use whisrs::{Config, InjectorBackend, State};
+use whisrs::{Config, State};
 use xkb_type::ClipboardBackend;
 
 use crate::context::{DaemonContext, DaemonState};
 use crate::factory::get_model_for_backend;
-use crate::injection::{inject_text, is_terminal_class, type_text_at_cursor};
+use crate::injection::{
+    deliver_streaming_delta, inject_text, is_terminal_class, notify_copied_for_held_modifier,
+    Injection, KeystrokeSettings, ModifierWaitTracker, StreamingDelivery,
+};
 use crate::notify::{send_notification, truncate_preview};
 
 const TYPING_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,8 +66,8 @@ pub(crate) struct StreamingPipelineParams {
     pub(crate) audio_feedback: bool,
     pub(crate) audio_feedback_volume: f32,
     pub(crate) backend_name: String,
-    pub(crate) key_delay: Duration,
-    pub(crate) injector_backend: InjectorBackend,
+    /// `[input]` key delay, backend and modifier wait (#154).
+    pub(crate) keys: KeystrokeSettings,
     /// `[input] clipboard_fallback`: leave the final transcript in the
     /// clipboard as a manual-fix fallback for silent injection failures.
     pub(crate) clipboard_fallback: bool,
@@ -94,8 +97,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         audio_feedback,
         audio_feedback_volume,
         backend_name,
-        key_delay,
-        injector_backend,
+        keys,
         clipboard_fallback,
         clipboard_only,
     } = params;
@@ -134,6 +136,13 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
     // batcher, and the clipboard write below still has to know whether the
     // run ended in a cancel.
     let clipboard_cancel = Arc::clone(&cancel_flag);
+    // Third handle: a delta waiting on a held modifier (#154) polls it, so
+    // `whisrs cancel` ends that wait and discards the delta.
+    let sink_cancel = Arc::clone(&cancel_flag);
+    // Time deltas spend waiting on a held modifier, kept out of the drain
+    // timeout below.
+    let modifier_waits = Arc::new(ModifierWaitTracker::default());
+    let sink_modifier_waits = Arc::clone(&modifier_waits);
     let typing_task = tokio::spawn(async move {
         // Focus the original window before the first batch (only once).
         // Sequenced by the batcher awaiting each sink call, so a plain
@@ -144,6 +153,8 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                 let wid = wid.clone();
                 let tracker = Arc::clone(&window_tracker);
                 let focused = Arc::clone(&focused);
+                let cancel = Arc::clone(&sink_cancel);
+                let modifier_waits = Arc::clone(&sink_modifier_waits);
                 async move {
                     if !clipboard_only {
                         // Focus the original window (only once, or re-focus if needed).
@@ -157,16 +168,27 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
                             }
                         }
 
-                        info!("typing: {:?}", text_to_type);
                         // Streaming deliberately bypasses `inject_text` / `[input]
                         // paste`: partial deltas are typed as they arrive, and a
-                        // paste per delta would thrash the clipboard.
+                        // paste per delta would thrash the clipboard. A held
+                        // modifier makes the delta wait, uncapped, until it is
+                        // released or the session is cancelled (#154).
                         match tokio::task::spawn_blocking(move || {
-                            type_text_at_cursor(&text_to_type, key_delay, injector_backend)
+                            deliver_streaming_delta(&text_to_type, keys, &cancel, &modifier_waits)
+                                .map(|delivery| (delivery, text_to_type))
                         })
                         .await
                         {
-                            Ok(Ok(())) => {}
+                            Ok(Ok((StreamingDelivery::Typed, text))) => {
+                                info!("typed: {text:?}");
+                            }
+                            Ok(Ok((StreamingDelivery::Cancelled, text))) => {
+                                info!(
+                                    "cancelled while a modifier key was held; discarded \
+                                     {} untyped chars",
+                                    text.len()
+                                );
+                            }
                             Ok(Err(e)) => warn!("failed to type text: {e:#}"),
                             Err(e) => warn!("failed to join typing task: {e}"),
                         }
@@ -252,40 +274,80 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 
     // Wait for the typing side to observe the closed text channel and drain
     // any final batch. If that somehow gets stuck, abort it so the daemon can
-    // return to Idle instead of staying in Transcribing forever.
+    // return to Idle instead of staying in Transcribing forever. A delta
+    // waiting on a held modifier (#154) is not stuck: that time does not
+    // count, and the budget restarts once the modifier is released. Only
+    // `whisrs cancel` ends such a wait early.
     debug!("waiting for typing task to finish");
     let mut typing_task = typing_task;
-    let full_text = tokio::select! {
-        result = &mut typing_task => {
-            match result {
-                Ok(text) => text,
-                Err(e) => {
-                    warn!("typing task join failed during pipeline shutdown: {e}");
-                    String::new()
+    let drain_start = std::time::Instant::now();
+    let full_text = loop {
+        // While a delta waits on a modifier there is no deadline yet: look
+        // again one budget later.
+        let wake = modifier_waits
+            .drain_deadline(drain_start, TYPING_DRAIN_TIMEOUT)
+            .unwrap_or_else(|| std::time::Instant::now() + TYPING_DRAIN_TIMEOUT);
+        tokio::select! {
+            result = &mut typing_task => {
+                break match result {
+                    Ok(text) => text,
+                    Err(e) => {
+                        warn!("typing task join failed during pipeline shutdown: {e}");
+                        String::new()
+                    }
+                };
+            }
+            _ = tokio::time::sleep_until(wake.into()) => {
+                let expired = modifier_waits
+                    .drain_deadline(drain_start, TYPING_DRAIN_TIMEOUT)
+                    .is_some_and(|deadline| deadline <= std::time::Instant::now());
+                if !expired {
+                    debug!("typing task is waiting for a held modifier key; still draining");
+                    continue;
                 }
+                warn!(
+                    "typing task did not finish within {TYPING_DRAIN_TIMEOUT:?}; aborting to \
+                     unblock daemon state"
+                );
+                typing_task.abort();
+                break match typing_task.await {
+                    Ok(text) => text,
+                    Err(e) if e.is_cancelled() => String::new(),
+                    Err(e) => {
+                        warn!("typing task reported an unexpected shutdown error after abort: {e}");
+                        String::new()
+                    }
+                };
             }
         }
-        _ = tokio::time::sleep(TYPING_DRAIN_TIMEOUT) => {
-            warn!(
-                "typing task did not finish within {:?}; aborting to unblock daemon state",
-                TYPING_DRAIN_TIMEOUT
-            );
-            typing_task.abort();
-            match typing_task.await {
-                Ok(text) => text,
-                Err(e) if e.is_cancelled() => String::new(),
-                Err(e) => {
-                    warn!("typing task reported an unexpected shutdown error after abort: {e}");
-                    String::new()
-                }
-            }
-        }
+    };
+
+    // `whisrs cancel` after stop (#154): the session is discarded, like a
+    // cancel during recording. No history entry, no done cue. Every writer of
+    // the flag holds the daemon-state lock and first finds it in
+    // `streaming_cancel`, so reading it and clearing that slot under one
+    // lock decides the outcome for good: a cancel that lands later finds no
+    // flag and gets the plain "nothing to cancel" error instead of a
+    // "Dictation cancelled" toast followed by this session's history entry
+    // and done cue.
+    let cancelled = {
+        daemon_state
+            .lock()
+            .await
+            .release_streaming_cancel(&cancel_flag);
+        cancel_flag.load(Ordering::SeqCst)
+    };
+    let full_text = if cancelled {
+        info!("streaming session cancelled after stop; discarding its transcript");
+        String::new()
+    } else {
+        full_text
     };
 
     // Notify user about streaming errors. Errors always pop, even with the
     // overlay on — the overlay can't carry the failure detail.
     if let Some(err_msg) = &stream_error {
-        if notify_error {
+        if notify_error && !cancelled {
             if full_text.is_empty() {
                 send_notification("whisrs", &format!("Transcription error: {err_msg}"));
             } else {
@@ -315,10 +377,10 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
         // session language so it can't leak into the next recording.
         ds.session_language = None;
         let _ = state_tx.send(ds.state_machine.state());
-        if audio_feedback {
+        if audio_feedback && !cancelled {
             feedback::play_done(audio_feedback_volume);
         }
-        if notify_state {
+        if notify_state && !cancelled {
             let preview = truncate_preview(&full_text, 77);
             if !preview.is_empty() {
                 send_notification("whisrs", &format!("Done: {preview}"));
@@ -349,7 +411,7 @@ pub(crate) async fn run_streaming_pipeline(params: StreamingPipelineParams) -> R
 /// deltas. For Lemonade-compatible profiles, the protocol layer only forwards
 /// completed utterances, so this loop naturally types phrase-sized chunks
 /// without needing any replacement semantics.
-async fn run_typing_batcher<F, Fut>(
+pub(crate) async fn run_typing_batcher<F, Fut>(
     mut text_rx: tokio::sync::mpsc::Receiver<String>,
     cancel: Arc<AtomicBool>,
     filler_filter: Option<FillerFilter>,
@@ -949,8 +1011,7 @@ pub(crate) async fn process_recording_batch(
     // typed, tagged by `history_backend_tag` with whether the LLM produced it.
     let outcome = apply_llm_post_process(text, context).await;
 
-    let key_delay = std::time::Duration::from_millis(context.config.input.key_delay_ms);
-    let injector_backend = context.config.input.backend;
+    let keys = KeystrokeSettings::from_config(&context.config.input);
     let paste = context.config.input.paste;
     let clipboard_fallback = context.config.input.clipboard_fallback;
     let clipboard_only = context.config.input.clipboard_only;
@@ -985,8 +1046,7 @@ pub(crate) async fn process_recording_batch(
         inject_text(
             &text_clone,
             is_terminal,
-            key_delay,
-            injector_backend,
+            keys,
             paste,
             clipboard_fallback,
             clipboard_only,
@@ -994,7 +1054,12 @@ pub(crate) async fn process_recording_batch(
     })
     .await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(Injection::Delivered)) => {}
+        Ok(Ok(Injection::CopiedForHeldModifier)) => {
+            if context.notify_error() {
+                notify_copied_for_held_modifier(&outcome.text);
+            }
+        }
         Ok(Err(e)) => warn!("failed to inject text: {e:#}"),
         Err(e) => warn!("failed to join injection task: {e}"),
     }

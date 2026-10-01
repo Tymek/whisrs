@@ -10,6 +10,7 @@ use whisrs::state::Action;
 use whisrs::{validate_language_override, Response, State};
 
 use crate::context::{DaemonContext, DaemonState};
+use crate::injection::KeystrokeSettings;
 use crate::notify::{send_notification, truncate_preview};
 use crate::pipeline::{
     build_transcription_config, format_no_microphone_error, history_backend_tag,
@@ -112,8 +113,7 @@ pub(crate) async fn handle_toggle(
                     audio_feedback: context.config.general.audio_feedback,
                     audio_feedback_volume: context.config.general.audio_feedback_volume,
                     backend_name: context.config.general.backend.clone(),
-                    key_delay: std::time::Duration::from_millis(context.config.input.key_delay_ms),
-                    injector_backend: context.config.input.backend,
+                    keys: KeystrokeSettings::from_config(&context.config.input),
                     clipboard_fallback: context.config.input.clipboard_fallback,
                     clipboard_only: context.config.input.clipboard_only,
                 };
@@ -181,9 +181,16 @@ pub(crate) async fn handle_toggle(
                     let capture = ds.audio_capture.take();
                     let window_id = ds.recording_window_id.take();
                     let streaming_task = ds.streaming_task.take();
-                    // Normal stop: drop the cancel flag untriggered so the
-                    // pipeline drains and types the remaining text.
-                    ds.streaming_cancel = None;
+                    // Kept to release the slot once the pipeline task is
+                    // awaited, in case it never reached its own tail.
+                    let streaming_cancel = ds.streaming_cancel.clone();
+                    // Normal stop: leave the cancel flag untriggered so the
+                    // pipeline drains and types the remaining text. It stays
+                    // in the state until the pipeline ends, so `whisrs
+                    // cancel` can still discard a delta that is waiting for a
+                    // held modifier key (#154); the pipeline's tail clears
+                    // it, and so does the await below if the pipeline exited
+                    // early (error or panic) without reaching that tail.
                     let recording_started_at = ds.recording_started_at.take();
                     // A plain toggle-stop on a command-mode / llm-command
                     // recording takes the session over as plain dictation: the
@@ -251,6 +258,9 @@ pub(crate) async fn handle_toggle(
                         .map(|t| t.elapsed().as_secs_f64())
                         .unwrap_or(0.0);
                     let mut ds = daemon_state.lock().await;
+                    if let Some(flag) = &streaming_cancel {
+                        ds.release_streaming_cancel(flag);
+                    }
                     match ds.state_machine.transition(Action::TranscriptionDone) {
                         Ok(new_state) => {
                             // Broadcast idle state for tray.
@@ -375,6 +385,23 @@ pub(crate) async fn handle_cancel(
                 send_notification("whisrs", "Recording cancelled");
             }
             Response::Ok { state: new_state }
+        }
+        // Stopped streaming session still draining: the last deltas may be
+        // waiting for a held modifier key, uncapped (#154). The state stays
+        // Transcribing (the machine has no Transcribing → Idle cancel); the
+        // flag ends the wait, the pending text is discarded, and the
+        // pipeline's own tail moves the state to Idle.
+        Err(_) if ds.streaming_session_draining() => {
+            if let Some(cancel) = ds.streaming_cancel.take() {
+                cancel.store(true, Ordering::SeqCst);
+            }
+            info!("cancelled streaming session after stop; discarding untyped text");
+            if context.notify_state() {
+                send_notification("whisrs", "Dictation cancelled");
+            }
+            Response::Ok {
+                state: State::Transcribing,
+            }
         }
         // Nothing was recording. If we still interrupted TTS playback, that's a
         // successful cancel — report the current (Idle) state rather than the
@@ -623,5 +650,41 @@ mod tests {
             "streaming typing loop must be told to discard its tail"
         );
         assert_eq!(ds.state_machine.state(), State::Idle);
+    }
+
+    /// #154: a stopped streaming session is cancellable only while its flag
+    /// is still installed. Releasing it (pipeline tail, or `handle_toggle`
+    /// after an early pipeline error/panic) must leave a later
+    /// `Transcribing` (e.g. command mode) on the old "cannot cancel" path,
+    /// and must never clear a newer session's flag.
+    #[test]
+    fn release_streaming_cancel_ends_post_stop_cancel_window() {
+        let mut ds = DaemonState::new();
+        let old_flag = Arc::new(AtomicBool::new(false));
+        ds.streaming_cancel = Some(Arc::clone(&old_flag));
+        ds.state_machine.transition(Action::Toggle).unwrap(); // → Recording
+        assert!(
+            !ds.streaming_session_draining(),
+            "recording is not draining"
+        );
+        ds.state_machine.transition(Action::Toggle).unwrap(); // → Transcribing
+        assert!(ds.streaming_session_draining());
+
+        // A newer session's flag is never cleared by the old session.
+        let new_flag = Arc::new(AtomicBool::new(false));
+        ds.streaming_cancel = Some(Arc::clone(&new_flag));
+        ds.release_streaming_cancel(&old_flag);
+        assert!(ds
+            .streaming_cancel
+            .as_ref()
+            .is_some_and(|f| Arc::ptr_eq(f, &new_flag)));
+
+        ds.release_streaming_cancel(&new_flag);
+        assert!(ds.streaming_cancel.is_none());
+        assert_eq!(ds.state_machine.state(), State::Transcribing);
+        assert!(
+            !ds.streaming_session_draining(),
+            "a Transcribing with no streaming flag must keep the old cancel error"
+        );
     }
 }

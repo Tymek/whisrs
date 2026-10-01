@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -96,12 +97,322 @@ pub(crate) fn prepare_llm_injection(
     LlmInjection::Inject(cleaned)
 }
 
-/// Type text at the cursor using uinput (keyboard injection) or clipboard paste.
-pub(crate) fn type_text_at_cursor(
+/// The `[input]` settings every synthetic keystroke needs, bundled because
+/// they always travel together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeystrokeSettings {
+    /// `[input] key_delay_ms`.
+    pub(crate) key_delay: std::time::Duration,
+    /// `[input] backend`.
+    pub(crate) backend: InjectorBackend,
+    /// `[input] modifier_wait_ms`: the cap on waiting for held physical
+    /// modifiers before a batch or command-mode keystroke (#154). Zero means
+    /// don't wait: a held modifier sends the text straight to the clipboard.
+    /// Streaming ignores it and always waits for the release (see
+    /// [`deliver_streaming_delta`]).
+    pub(crate) modifier_wait: std::time::Duration,
+}
+
+impl KeystrokeSettings {
+    pub(crate) fn from_config(input: &whisrs::InputConfig) -> Self {
+        Self {
+            key_delay: std::time::Duration::from_millis(input.key_delay_ms),
+            backend: input.backend,
+            modifier_wait: std::time::Duration::from_millis(input.modifier_wait_ms),
+        }
+    }
+}
+
+/// What a keystroke request did.
+///
+/// A held modifier is not an error: the keys were deliberately withheld, and
+/// the caller owes the text a clipboard copy instead (#154). Hence an `Ok`
+/// variant the caller must match, not an `Err` it could log and drop.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeystrokeOutcome {
+    /// The keystrokes were sent.
+    Sent,
+    /// A physical modifier was still held when
+    /// [`KeystrokeSettings::modifier_wait`] ran out. Nothing was sent.
+    ModifierHeld,
+}
+
+/// Where a batch injection's text ended up.
+///
+/// The held-modifier copy (#154) is a success for the text, but the user
+/// expects it at the cursor, so the caller (which holds the notify config)
+/// owes them a toast; the injection code runs in `spawn_blocking` without it.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Injection {
+    /// Typed, pasted, or (under `clipboard_only`) copied as configured.
+    Delivered,
+    /// A physical modifier was still held after `[input] modifier_wait_ms`:
+    /// no keys were sent and the text was copied to the clipboard instead.
+    CopiedForHeldModifier,
+}
+
+/// Toast summary for [`Injection::CopiedForHeldModifier`].
+pub(crate) const HELD_MODIFIER_TOAST: &str = "Modifier key held: text copied to clipboard";
+
+/// Tell the user their text went to the clipboard, not the cursor (#154).
+/// The caller gates this on `notify_error()`: the `warn!` alone only reaches
+/// the journal, and a dictation that silently did not type looks lost.
+pub(crate) fn notify_copied_for_held_modifier(text: &str) {
+    crate::notify::send_notification(
+        HELD_MODIFIER_TOAST,
+        &crate::notify::truncate_preview(text, 77),
+    );
+}
+
+/// Batch typing at the cursor via the persistent virtual keyboard,
+/// optionally clearing the prompt line first (see
+/// [`clear_line_best_effort`]). Sends nothing while a physical modifier is
+/// held past `keys.modifier_wait`; see [`KeystrokeOutcome`]. The clear and
+/// the typing share one modifier wait and one hold of [`KEYBOARD`], so a
+/// modifier pressed in between cannot leave a cleared line with nothing
+/// typed on it.
+fn type_text_with_clear(
     text: &str,
-    key_delay: std::time::Duration,
-    backend: InjectorBackend,
-) -> Result<()> {
+    keys: KeystrokeSettings,
+    clear_line: bool,
+) -> Result<KeystrokeOutcome> {
+    with_persistent_keyboard(keys, capped_wait(keys), |keyboard| {
+        if clear_line {
+            clear_line_best_effort(keyboard);
+        }
+        keyboard.type_text(text).context("failed to type text")
+    })
+    .map(batch_outcome)
+}
+
+/// The batch modifier wait: up to `[input] modifier_wait_ms`, no cancel.
+fn capped_wait(keys: KeystrokeSettings) -> impl FnOnce() -> ModifierWait {
+    move || wait_for_physical_modifier_release(keys.modifier_wait)
+}
+
+/// A batch keystroke's [`KeystrokeOutcome`] from how its modifier wait
+/// ended. The batch wait has no cancel, so anything but a release (or no
+/// hold at all) means the cap ran out.
+fn batch_outcome(wait: ModifierWait) -> KeystrokeOutcome {
+    if wait.lets_keys_through() {
+        KeystrokeOutcome::Sent
+    } else {
+        KeystrokeOutcome::ModifierHeld
+    }
+}
+
+/// Put `text` on the clipboard because a held modifier stopped it from being
+/// typed or pasted (#154). A failed copy is an error: the copy is the only
+/// place the text went.
+fn copy_instead_of_keystrokes(
+    clipboard: &dyn ClipboardBackend,
+    text: &str,
+    modifier_wait: std::time::Duration,
+) -> Result<Injection> {
+    clipboard
+        .set_text(text)
+        .context("a modifier key was held, and copying the text to the clipboard instead failed")?;
+    warn_copied_instead(modifier_wait, text.len());
+    Ok(Injection::CopiedForHeldModifier)
+}
+
+/// The one warning for "not typed, copied instead" (#154).
+fn warn_copied_instead(modifier_wait: std::time::Duration, len: usize) {
+    warn!(
+        "a modifier key was still held after {} ms; copied {len} chars to the \
+         clipboard instead of typing them",
+        modifier_wait.as_millis()
+    );
+}
+
+/// What happened to one streaming delta (#154).
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamingDelivery {
+    /// The delta was typed at the cursor.
+    Typed,
+    /// The session was cancelled while the delta waited for a held modifier
+    /// to be released. Nothing was typed or copied: the text is discarded.
+    Cancelled,
+}
+
+/// Streaming dictation's delivery of one typed delta (#154).
+///
+/// Unlike the batch path, streaming never gives up on a held modifier and
+/// never switches to the clipboard: it waits for every physical modifier to
+/// be released, however long that takes, then types. Deltas that arrive
+/// meanwhile queue in the typing batcher and are typed in order afterwards.
+/// `[input] modifier_wait_ms` does not apply here. The only way out of the
+/// wait is `cancel` (`whisrs cancel`), which discards the delta.
+///
+/// `tracker` records the time spent waiting, so the pipeline's drain timeout
+/// after stop does not count it (see [`ModifierWaitTracker`]).
+pub(crate) fn deliver_streaming_delta(
+    delta: &str,
+    keys: KeystrokeSettings,
+    cancel: &AtomicBool,
+    tracker: &ModifierWaitTracker,
+) -> Result<StreamingDelivery> {
+    let wait = with_persistent_keyboard(
+        keys,
+        || wait_for_physical_modifier_release_until_cancelled(cancel, tracker),
+        |keyboard| keyboard.type_text(delta).context("failed to type text"),
+    )?;
+    Ok(if wait.lets_keys_through() {
+        StreamingDelivery::Typed
+    } else {
+        StreamingDelivery::Cancelled
+    })
+}
+
+/// Time streaming deliveries spend waiting on a held modifier (#154), shared
+/// with the pipeline's drain after stop. The drain timeout guards against a
+/// stuck typing task, not a user holding Alt: while a delta waits, the drain
+/// must not abort it, and once the wait ends the drain gets its full budget
+/// again.
+#[derive(Debug, Default)]
+pub(crate) struct ModifierWaitTracker {
+    state: StdMutex<ModifierWaitState>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ModifierWaitState {
+    /// A delta is waiting on a held modifier right now.
+    waiting: bool,
+    /// When the last such wait ended.
+    last_end: Option<std::time::Instant>,
+}
+
+impl ModifierWaitTracker {
+    fn update(&self, f: impl FnOnce(&mut ModifierWaitState)) {
+        f(&mut self.state.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    fn begin(&self) {
+        self.update(|s| s.waiting = true);
+    }
+
+    fn end(&self) {
+        self.update(|s| {
+            s.waiting = false;
+            s.last_end = Some(std::time::Instant::now());
+        });
+    }
+
+    /// When the drain that started at `drain_start` may give up on the
+    /// typing task: `budget` after the later of `drain_start` and the end of
+    /// the last modifier wait. `None` while a delta is still waiting: no
+    /// deadline at all until the modifier is released (or the session is
+    /// cancelled).
+    pub(crate) fn drain_deadline(
+        &self,
+        drain_start: std::time::Instant,
+        budget: std::time::Duration,
+    ) -> Option<std::time::Instant> {
+        let state = *self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.waiting {
+            return None;
+        }
+        let from = state
+            .last_end
+            .map_or(drain_start, |end| end.max(drain_start));
+        Some(from + budget)
+    }
+}
+
+/// Send a paste keystroke — Ctrl+V, or Ctrl+Shift+V in terminals — via the
+/// **persistent** virtual keyboard (the same device typing uses).
+///
+/// Must NOT use a fresh per-call uinput device: on some compositors (e.g.
+/// KWin) keystrokes from a device the compositor hasn't finished enumerating
+/// are dropped, so the paste silently no-ops. The persistent device is already
+/// recognized, so its keystrokes land. The combo is raw keycodes (`KEY_V` is
+/// `v` in every common layout), so it stays layout-independent.
+///
+/// With `clear_line`, the prompt line is cleared first under the same
+/// modifier wait and lock hold, as in [`type_text_with_clear`].
+fn paste_via_keyboard(
+    is_terminal: bool,
+    keys: KeystrokeSettings,
+    clear_line: bool,
+) -> Result<KeystrokeOutcome> {
+    use evdev::Key;
+
+    let combo: &[Key] = if is_terminal {
+        &[Key::KEY_LEFTCTRL, Key::KEY_LEFTSHIFT, Key::KEY_V]
+    } else {
+        &[Key::KEY_LEFTCTRL, Key::KEY_V]
+    };
+
+    with_persistent_keyboard(keys, capped_wait(keys), |keyboard| {
+        if clear_line {
+            clear_line_best_effort(keyboard);
+        }
+        keyboard
+            .send_combo(combo)
+            .context("failed to send paste combo")
+    })
+    .map(batch_outcome)
+}
+
+/// Clear the current shell prompt line by sending Ctrl+A ("move to start of
+/// line") then Ctrl+K ("kill to end of line") on `keyboard`, the
+/// **persistent** virtual keyboard, from inside the same
+/// [`with_persistent_keyboard`] call that then types or pastes the text. That
+/// readline / zle / fish editing pair empties the line in bash, zsh and fish
+/// alike.
+///
+/// Only ever called for terminals. A terminal's mouse highlight is a visual
+/// overlay, not an editable selection, so injecting at the cursor would append
+/// to the existing line rather than replace it. Clearing the line first makes
+/// the injected text the whole line, which is what a "rewrite my selection"
+/// command means at a prompt. In GUI text widgets no clear is needed (or
+/// wanted): typing/pasting over a real selection replaces it natively.
+///
+/// Must NOT use a fresh per-call uinput device: on some compositors (e.g.
+/// KWin) keystrokes from a device the compositor hasn't finished enumerating
+/// are dropped, so the clear silently no-ops. The persistent device is already
+/// recognized, so its keystrokes land.
+///
+/// Best-effort: a failed clear is logged and the text is injected anyway,
+/// because appending beats losing it.
+fn clear_line_best_effort(keyboard: &mut dyn xkb_type::KeyInjector) {
+    use evdev::Key;
+
+    let result = keyboard
+        .send_combo(&[Key::KEY_LEFTCTRL, Key::KEY_A])
+        .context("failed to send Ctrl+A (move to start of line)")
+        .and_then(|()| {
+            keyboard
+                .send_combo(&[Key::KEY_LEFTCTRL, Key::KEY_K])
+                .context("failed to send Ctrl+K (kill to end of line)")
+        });
+    if let Err(e) = result {
+        warn!("command mode: failed to clear terminal line, injecting anyway: {e:#}");
+    }
+}
+
+/// Run `send` against the persistent virtual keyboard, creating it on first
+/// use, once `wait_for_release` says no physical modifier is held.
+///
+/// The modifier wait (#154) is what keeps a `Super+W` stop hotkey from
+/// turning the injected keys into compositor binds: the final text is ready
+/// while the user's finger is often still on Super. No key is ever sent while
+/// a modifier is held: unless the wait ends in a release (or found nothing
+/// held), `send` is not called. Returns how the wait ended; `send` ran iff
+/// [`ModifierWait::lets_keys_through`]. The wait runs inside the lock, so a
+/// second injection queues behind it instead of slipping past. On a failed
+/// send the device is dropped so the next call rebuilds it.
+fn with_persistent_keyboard(
+    keys: KeystrokeSettings,
+    wait_for_release: impl FnOnce() -> ModifierWait,
+    send: impl FnOnce(&mut dyn xkb_type::KeyInjector) -> Result<()>,
+) -> Result<ModifierWait> {
+    let KeystrokeSettings {
+        key_delay, backend, ..
+    } = keys;
     let keyboard_slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
     let mut keyboard_guard = keyboard_slot
         .lock()
@@ -117,117 +428,217 @@ pub(crate) fn type_text_at_cursor(
         )?);
     }
 
+    let wait = wait_for_release();
+    if !wait.lets_keys_through() {
+        return Ok(wait);
+    }
+
     let keyboard = keyboard_guard
         .as_mut()
         .expect("keyboard exists after initialization");
     keyboard.set_key_delay(key_delay);
 
-    let result = keyboard.type_text(text).context("failed to type text");
+    let result = send(keyboard.as_mut());
     if result.is_err() {
         *keyboard_guard = None;
     }
-    result?;
-    Ok(())
+    result.map(|()| wait)
 }
 
-/// Send a paste keystroke — Ctrl+V, or Ctrl+Shift+V in terminals — via the
-/// **persistent** virtual keyboard (the same device `type_text_at_cursor`
-/// uses).
-///
-/// Must NOT use a fresh per-call uinput device: on some compositors (e.g.
-/// KWin) keystrokes from a device the compositor hasn't finished enumerating
-/// are dropped, so the paste silently no-ops. The persistent device is already
-/// recognized, so its keystrokes land. The combo is raw keycodes (`KEY_V` is
-/// `v` in every common layout), so it stays layout-independent.
-fn paste_via_keyboard(
-    is_terminal: bool,
-    key_delay: std::time::Duration,
-    backend: InjectorBackend,
-) -> Result<()> {
-    use evdev::Key;
+/// Poll interval for [`wait_for_modifier_release`].
+const MODIFIER_RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(15);
 
-    let keyboard_slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
-    let mut keyboard_guard = keyboard_slot
-        .lock()
-        .map_err(|_| anyhow::anyhow!("keyboard mutex poisoned"))?;
+/// Pause after a held modifier is released, before the first injected key,
+/// so the compositor has processed the queued physical release by then.
+/// Only paid when a modifier was actually seen held.
+const MODIFIER_RELEASE_SETTLE: std::time::Duration = std::time::Duration::from_millis(25);
 
-    if keyboard_guard.is_none() {
-        *keyboard_guard = Some(new_keyboard(
-            key_delay, /* prewarm = */ false, backend,
-        )?);
+/// Names of our own uinput devices: the persistent keyboard
+/// (`crates/xkb-type/src/keyboard.rs`) and the temporary one the selection
+/// copy builds (`selection.rs`). Both are skipped by the probe: their
+/// modifiers are the ones we press.
+#[cfg(not(test))]
+const OWN_DEVICE_NAMES: [&str; 2] = ["whisrs virtual keyboard", "whisrs command"];
+
+/// Block until no physical keyboard holds a modifier, up to `cap`
+/// (`[input] modifier_wait_ms`). The batch and command-mode wait: call before
+/// sending any synthetic keystroke (#154), and send nothing on
+/// [`ModifierWait::TimedOut`]. A zero `cap` means "don't wait": one reading,
+/// and a held modifier is an immediate [`ModifierWait::TimedOut`]. Takes only
+/// the keyboard-cache lock, never [`KEYBOARD`], so callers may hold
+/// [`KEYBOARD`] around it.
+pub(crate) fn wait_for_physical_modifier_release(cap: std::time::Duration) -> ModifierWait {
+    wait_for_modifier_release(
+        modifier_probe(),
+        Some(cap),
+        MODIFIER_RELEASE_POLL,
+        || false,
+        || {},
+    )
+}
+
+/// The streaming wait (#154): block until no physical keyboard holds a
+/// modifier, with no cap. `cancel` is checked on every poll, and a set flag
+/// ends the wait with [`ModifierWait::Cancelled`]. A wait that actually
+/// blocks is recorded in `tracker`.
+fn wait_for_physical_modifier_release_until_cancelled(
+    cancel: &AtomicBool,
+    tracker: &ModifierWaitTracker,
+) -> ModifierWait {
+    let wait = wait_for_modifier_release(
+        modifier_probe(),
+        None,
+        MODIFIER_RELEASE_POLL,
+        || cancel.load(Ordering::SeqCst),
+        || tracker.begin(),
+    );
+    if wait != ModifierWait::NotHeld {
+        tracker.end();
     }
+    wait
+}
 
-    let keyboard = keyboard_guard
-        .as_mut()
-        .expect("keyboard exists after initialization");
-    keyboard.set_key_delay(key_delay);
+/// How [`wait_for_modifier_release`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModifierWait {
+    /// Nothing was held; no wait at all.
+    NotHeld,
+    /// A modifier was held and released after this long.
+    Released(std::time::Duration),
+    /// A modifier was still held at the timeout.
+    TimedOut,
+    /// The wait was cancelled while a modifier was still held.
+    Cancelled,
+}
 
-    let combo: &[Key] = if is_terminal {
-        &[Key::KEY_LEFTCTRL, Key::KEY_LEFTSHIFT, Key::KEY_V]
-    } else {
-        &[Key::KEY_LEFTCTRL, Key::KEY_V]
+impl ModifierWait {
+    /// Whether keys may be sent: nothing was held, or it was released.
+    pub(crate) fn lets_keys_through(self) -> bool {
+        matches!(self, Self::NotHeld | Self::Released(_))
+    }
+}
+
+/// Block until `modifier_held` reports false, polling every `interval` for
+/// at most `timeout` (`None`: no limit). Returns at once, without sleeping,
+/// when nothing is held. Otherwise `on_hold` runs once, and `cancelled` is
+/// checked before every poll. After a seen release it sleeps
+/// [`MODIFIER_RELEASE_SETTLE`] more. The caller decides what a timeout or a
+/// cancel means; it must not send keys.
+fn wait_for_modifier_release(
+    mut modifier_held: impl FnMut() -> bool,
+    timeout: Option<std::time::Duration>,
+    interval: std::time::Duration,
+    mut cancelled: impl FnMut() -> bool,
+    on_hold: impl FnOnce(),
+) -> ModifierWait {
+    if !modifier_held() {
+        return ModifierWait::NotHeld;
+    }
+    on_hold();
+    let start = std::time::Instant::now();
+    loop {
+        if cancelled() {
+            debug!("modifier wait cancelled while a modifier key was held; sending no keys");
+            return ModifierWait::Cancelled;
+        }
+        let elapsed = start.elapsed();
+        let mut nap = interval;
+        if let Some(timeout) = timeout {
+            if elapsed >= timeout {
+                debug!("a modifier key is still held after {timeout:?}; sending no keys");
+                return ModifierWait::TimedOut;
+            }
+            nap = nap.min(timeout - elapsed);
+        }
+        std::thread::sleep(nap);
+        if !modifier_held() {
+            let waited = start.elapsed();
+            debug!("waited {waited:?} for held modifiers to release before injecting");
+            std::thread::sleep(MODIFIER_RELEASE_SETTLE);
+            return ModifierWait::Released(waited);
+        }
+    }
+}
+
+/// Keyboards the modifier probe reads, cached across waits (#154): opening
+/// every `/dev/input` node per injection costs 100+ ms, reading a cached
+/// device's key state costs microseconds.
+#[cfg(not(test))]
+static KEYBOARD_CACHE: OnceLock<StdMutex<whisrs::hotkey::KeyboardCache>> = OnceLock::new();
+
+#[cfg(not(test))]
+fn keyboard_cache() -> &'static StdMutex<whisrs::hotkey::KeyboardCache> {
+    KEYBOARD_CACHE
+        .get_or_init(|| StdMutex::new(whisrs::hotkey::KeyboardCache::new(&OWN_DEVICE_NAMES)))
+}
+
+/// Sync [`KEYBOARD_CACHE`] with `/dev/input`, opening only new nodes.
+#[cfg(not(test))]
+fn refresh_keyboard_cache(cache: &mut whisrs::hotkey::KeyboardCache) {
+    if let Err(e) = cache.refresh() {
+        debug!("cannot list keyboards for modifier check: {e:#}");
+    }
+}
+
+/// Fill the modifier probe's keyboard cache at startup, so the first
+/// injection does not pay for opening every input device. Blocking; run it
+/// off the async runtime.
+#[cfg(not(test))]
+pub(crate) fn prime_modifier_probe() {
+    let Ok(mut cache) = keyboard_cache().lock() else {
+        return;
     };
-
-    let result = keyboard
-        .send_combo(combo)
-        .context("failed to send paste combo");
-    if result.is_err() {
-        *keyboard_guard = None;
-    }
-    result
+    let start = std::time::Instant::now();
+    refresh_keyboard_cache(&mut cache);
+    debug!(
+        "modifier probe: {} keyboard(s) cached in {:?}",
+        cache.keyboard_count(),
+        start.elapsed()
+    );
 }
 
-/// Clear the current shell prompt line by sending Ctrl+A ("move to start of
-/// line") then Ctrl+K ("kill to end of line") via the **persistent** virtual
-/// keyboard (the same device `type_text_at_cursor` and `paste_via_keyboard`
-/// use). That readline / zle / fish editing pair empties the line in bash, zsh
-/// and fish alike.
+/// Test build: never touch the real `/dev/input`.
+#[cfg(test)]
+pub(crate) fn prime_modifier_probe() {}
+
+/// The modifier probe for [`wait_for_modifier_release`]: true while any
+/// physical keyboard reports a modifier down (`EVIOCGKEY`).
 ///
-/// Only ever called for terminals. A terminal's mouse highlight is a visual
-/// overlay, not an editable selection, so injecting at the cursor would append
-/// to the existing line rather than replace it. Clearing the line first makes
-/// the injected text the whole line, which is what a "rewrite my selection"
-/// command means at a prompt. In GUI text widgets no clear is needed (or
-/// wanted): typing/pasting over a real selection replaces it natively.
-///
-/// Must NOT use a fresh per-call uinput device: on some compositors (e.g.
-/// KWin) keystrokes from a device the compositor hasn't finished enumerating
-/// are dropped, so the clear silently no-ops. The persistent device is already
-/// recognized, so its keystrokes land.
-pub(crate) fn clear_line_via_keyboard(
-    key_delay: std::time::Duration,
-    backend: InjectorBackend,
-) -> Result<()> {
-    use evdev::Key;
-
-    let keyboard_slot = KEYBOARD.get_or_init(|| StdMutex::new(None));
-    let mut keyboard_guard = keyboard_slot
-        .lock()
-        .map_err(|_| anyhow::anyhow!("keyboard mutex poisoned"))?;
-
-    if keyboard_guard.is_none() {
-        *keyboard_guard = Some(new_keyboard(
-            key_delay, /* prewarm = */ false, backend,
-        )?);
+/// The keyboard cache is synced once per wait (new nodes opened, gone ones
+/// dropped), not per poll. A device that cannot be opened or read counts as
+/// not held, so without `/dev/input` access this degrades to no wait rather
+/// than blocking.
+#[cfg(not(test))]
+fn modifier_probe() -> impl FnMut() -> bool {
+    if let Ok(mut cache) = keyboard_cache().lock() {
+        refresh_keyboard_cache(&mut cache);
     }
-
-    let keyboard = keyboard_guard
-        .as_mut()
-        .expect("keyboard exists after initialization");
-    keyboard.set_key_delay(key_delay);
-
-    let result = keyboard
-        .send_combo(&[Key::KEY_LEFTCTRL, Key::KEY_A])
-        .context("failed to send Ctrl+A (move to start of line)")
-        .and_then(|()| {
-            keyboard
-                .send_combo(&[Key::KEY_LEFTCTRL, Key::KEY_K])
-                .context("failed to send Ctrl+K (kill to end of line)")
-        });
-    if result.is_err() {
-        *keyboard_guard = None;
+    || {
+        keyboard_cache()
+            .lock()
+            .is_ok_and(|mut cache| cache.any_modifier_held())
     }
-    result
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam for [`modifier_probe`]: tests must never read the real
+    /// `/dev/input`. Unset means "nothing held".
+    static MODIFIER_PROBE: std::cell::RefCell<Option<Box<dyn FnMut() -> bool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `probe` as this thread's modifier probe, then unset it.
+#[cfg(test)]
+pub(crate) fn with_modifier_probe(probe: impl FnMut() -> bool + 'static, f: impl FnOnce()) {
+    MODIFIER_PROBE.with(|p| *p.borrow_mut() = Some(Box::new(probe)));
+    f();
+    MODIFIER_PROBE.with(|p| *p.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn modifier_probe() -> impl FnMut() -> bool {
+    || MODIFIER_PROBE.with(|probe| probe.borrow_mut().as_mut().is_some_and(|f| f()))
 }
 
 /// Inject `text` at the cursor, choosing keystrokes or clipboard paste.
@@ -269,23 +680,29 @@ pub(crate) fn clear_line_via_keyboard(
 /// wins over `paste` and `clipboard_fallback` (both become no-ops), and a
 /// copy failure is a hard error — the copy is the entire feature, there is
 /// no injection to fall back to.
+///
+/// No keystroke is sent while a physical modifier is held (#154). If one is
+/// still down after `keys.modifier_wait`, the text is copied to the clipboard
+/// instead of typed or pasted, with a `warn!`, and the result is
+/// [`Injection::CopiedForHeldModifier`] so the caller can notify. That copy is
+/// a hard error on failure, like `clipboard_only`: it is the only place the
+/// text went.
 pub(crate) fn inject_text(
     text: &str,
     is_terminal: bool,
-    key_delay: std::time::Duration,
-    backend: InjectorBackend,
+    keys: KeystrokeSettings,
     paste: bool,
     clipboard_fallback: bool,
     clipboard_only: bool,
-) -> Result<()> {
+) -> Result<Injection> {
     inject_text_with_clipboard(
         text,
         is_terminal,
-        key_delay,
-        backend,
+        keys,
         paste,
         clipboard_fallback,
         clipboard_only,
+        /* clear_line = */ false,
         CLIPBOARD_RESTORE_DELAY,
         Arc::from(xkb_type::default_clipboard()),
     )
@@ -296,19 +713,21 @@ pub(crate) fn inject_text(
 /// without a real clipboard (or a 500 ms wait). `clipboard` is an `Arc`
 /// because the post-paste restore runs on a spawned thread, which needs
 /// `'static` access; the production entry point wraps
-/// `xkb_type::default_clipboard()`.
+/// `xkb_type::default_clipboard()`. `clear_line` is command mode's terminal
+/// line clear, sent under the same modifier wait as the text (see
+/// [`clear_line_and_inject`]).
 #[allow(clippy::too_many_arguments)]
 fn inject_text_with_clipboard(
     text: &str,
     is_terminal: bool,
-    key_delay: std::time::Duration,
-    backend: InjectorBackend,
+    keys: KeystrokeSettings,
     paste: bool,
     clipboard_fallback: bool,
     clipboard_only: bool,
+    clear_line: bool,
     restore_delay: std::time::Duration,
     clipboard: Arc<dyn ClipboardBackend>,
-) -> Result<()> {
+) -> Result<Injection> {
     if clipboard_only {
         // The clipboard is the output, not the transport: nothing is
         // injected at the cursor, and a copy failure is a hard error —
@@ -316,11 +735,16 @@ fn inject_text_with_clipboard(
         clipboard
             .set_text(text)
             .context("failed to set clipboard in clipboard-only mode")?;
-        return Ok(());
+        return Ok(Injection::Delivered);
     }
 
     if !paste {
-        let result = type_text_at_cursor(text, key_delay, backend);
+        let result = type_text_with_clear(text, keys, clear_line);
+        if let Ok(KeystrokeOutcome::ModifierHeld) = result {
+            // Not typed: the copy is the delivery, and it already covers
+            // what `clipboard_fallback` would have written.
+            return copy_instead_of_keystrokes(clipboard.as_ref(), text, keys.modifier_wait);
+        }
         if clipboard_fallback {
             // The copy is the fallback, so it must happen even when the
             // typing failed — and a copy error must never change the Result
@@ -329,14 +753,21 @@ fn inject_text_with_clipboard(
                 warn!("failed to set clipboard fallback: {e}");
             }
         }
-        return result;
+        return result.map(|_| Injection::Delivered);
     }
 
     let saved = match clipboard.get_text() {
         Ok(s) => s,
         Err(e) => {
             debug!("clipboard unreadable as text, typing instead of pasting: {e:#}");
-            return type_text_at_cursor(text, key_delay, backend);
+            return match type_text_with_clear(text, keys, clear_line)? {
+                KeystrokeOutcome::Sent => Ok(Injection::Delivered),
+                // Overwrites the non-text clipboard (#69's concern), but the
+                // alternative is dropping the dictation, which is worse.
+                KeystrokeOutcome::ModifierHeld => {
+                    copy_instead_of_keystrokes(clipboard.as_ref(), text, keys.modifier_wait)
+                }
+            };
         }
     };
     clipboard
@@ -346,7 +777,16 @@ fn inject_text_with_clipboard(
     // Let the clipboard settle before the paste keystroke.
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let paste_result = paste_via_keyboard(is_terminal, key_delay, backend);
+    let paste_result = match paste_via_keyboard(is_terminal, keys, clear_line) {
+        Ok(KeystrokeOutcome::Sent) => Ok(Injection::Delivered),
+        Ok(KeystrokeOutcome::ModifierHeld) => {
+            // No Ctrl+V went out, and the text is already on the clipboard:
+            // leave it there, skipping the restore that would take it away.
+            warn_copied_instead(keys.modifier_wait, text.len());
+            return Ok(Injection::CopiedForHeldModifier);
+        }
+        Err(e) => Err(e),
+    };
 
     if clipboard_fallback {
         // The pasted text stays in the clipboard — that IS the fallback, so
@@ -378,6 +818,56 @@ fn inject_text_with_clipboard(
     });
 
     paste_result
+}
+
+/// Command mode at a terminal: clear the prompt line (Ctrl+A, Ctrl+K), then
+/// inject `text` so it replaces the highlighted command instead of being
+/// appended to it. `clipboard_only` is the caller's to rule out: that mode
+/// must never clear.
+///
+/// The clear and the text go out under one modifier wait and one hold of the
+/// keyboard lock (#154), so they land together or not at all: if a modifier
+/// is still held at the cap, neither is sent and `text` is copied to the
+/// clipboard instead, leaving the old line untouched. A clear that fails
+/// outright is still best-effort: the text is injected anyway, because
+/// appending beats losing it.
+pub(crate) fn clear_line_and_inject(
+    text: &str,
+    keys: KeystrokeSettings,
+    paste: bool,
+    clipboard_fallback: bool,
+) -> Result<Injection> {
+    clear_line_and_inject_with_clipboard(
+        text,
+        keys,
+        paste,
+        clipboard_fallback,
+        CLIPBOARD_RESTORE_DELAY,
+        Arc::from(xkb_type::default_clipboard()),
+    )
+}
+
+/// Testable core of [`clear_line_and_inject`], clipboard injected as in
+/// [`inject_text_with_clipboard`].
+fn clear_line_and_inject_with_clipboard(
+    text: &str,
+    keys: KeystrokeSettings,
+    paste: bool,
+    clipboard_fallback: bool,
+    restore_delay: std::time::Duration,
+    clipboard: Arc<dyn ClipboardBackend>,
+) -> Result<Injection> {
+    inject_text_with_clipboard(
+        text,
+        /* is_terminal = */ true,
+        keys,
+        paste,
+        clipboard_fallback,
+        /* clipboard_only = */ false,
+        /* clear_line = */ true,
+        restore_delay,
+        clipboard,
+    )
 }
 
 pub(crate) fn warm_keyboard(key_delay: std::time::Duration, backend: InjectorBackend) {
@@ -1301,10 +1791,13 @@ mod tests {
     /// Scripted keyboard double: records typed text and paste combos instead
     /// of opening /dev/uinput. `fail_typing` makes `type_text` error, to
     /// exercise the "copy even when typing fails" fallback contract.
+    /// `events` logs every keystroke in order, shared with the modifier
+    /// probe tests so they can see what ran first.
     #[derive(Default, Clone)]
     struct MockKeyboard {
         typed: Arc<StdMutex<Vec<String>>>,
         paste_combos: Arc<StdMutex<usize>>,
+        events: Arc<StdMutex<Vec<&'static str>>>,
         fail_typing: bool,
     }
 
@@ -1313,6 +1806,7 @@ mod tests {
             if self.fail_typing {
                 return Err(anyhow::anyhow!("mock typing failure"));
             }
+            self.events.lock().unwrap().push("type");
             self.typed.lock().unwrap().push(text.to_string());
             Ok(())
         }
@@ -1322,6 +1816,7 @@ mod tests {
         }
 
         fn send_combo(&mut self, _keys: &[evdev::Key]) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("combo");
             *self.paste_combos.lock().unwrap() += 1;
             Ok(())
         }
@@ -1343,6 +1838,21 @@ mod tests {
         *guard = previous;
     }
 
+    /// Keystroke settings for tests: a 1 ms key delay and a 200 ms modifier
+    /// cap, so a "held forever" probe times out quickly while a probe held
+    /// for a few 15 ms polls still releases well inside it.
+    fn test_keys() -> KeystrokeSettings {
+        test_keys_waiting(std::time::Duration::from_millis(200))
+    }
+
+    fn test_keys_waiting(modifier_wait: std::time::Duration) -> KeystrokeSettings {
+        KeystrokeSettings {
+            key_delay: std::time::Duration::from_millis(1),
+            backend: InjectorBackend::Uinput,
+            modifier_wait,
+        }
+    }
+
     /// Run the testable inject core with a mock keyboard installed and a
     /// near-zero restore delay, then give any spawned restore thread time to
     /// land before returning. Generic over the concrete clipboard type so
@@ -1354,17 +1864,38 @@ mod tests {
         paste: bool,
         clipboard_fallback: bool,
         clipboard_only: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Injection> {
+        inject_with_keys(
+            test_keys(),
+            keyboard,
+            clipboard,
+            text,
+            paste,
+            clipboard_fallback,
+            clipboard_only,
+        )
+    }
+
+    /// [`inject`] with explicit keystroke settings (for the modifier cap).
+    fn inject_with_keys<C: ClipboardBackend + 'static>(
+        keys: KeystrokeSettings,
+        keyboard: MockKeyboard,
+        clipboard: Arc<C>,
+        text: &str,
+        paste: bool,
+        clipboard_fallback: bool,
+        clipboard_only: bool,
+    ) -> anyhow::Result<Injection> {
         let mut result = None;
         with_keyboard(keyboard, || {
             result = Some(inject_text_with_clipboard(
                 text,
                 /* is_terminal = */ false,
-                std::time::Duration::from_millis(1),
-                InjectorBackend::Uinput,
+                keys,
                 paste,
                 clipboard_fallback,
                 clipboard_only,
+                /* clear_line = */ false,
                 std::time::Duration::from_millis(5),
                 clipboard,
             ));
@@ -1572,5 +2103,609 @@ mod tests {
             result.is_err(),
             "copy failure must surface in copy-only mode"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Modifier release before injection (#154)
+    // ---------------------------------------------------------------------
+
+    /// A probe that reports "held" for its first `held_for` calls, then
+    /// "released", counting every call.
+    fn scripted_probe(held_for: usize) -> (Arc<StdMutex<usize>>, impl FnMut() -> bool) {
+        let calls = Arc::new(StdMutex::new(0));
+        let counter = Arc::clone(&calls);
+        let probe = move || {
+            let mut n = counter.lock().unwrap();
+            *n += 1;
+            *n <= held_for
+        };
+        (calls, probe)
+    }
+
+    #[test]
+    fn modifier_wait_returns_at_once_when_nothing_is_held() {
+        let (calls, probe) = scripted_probe(0);
+        let start = std::time::Instant::now();
+        let outcome = wait_for_modifier_release(
+            probe,
+            Some(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(5),
+            || false,
+            || panic!("nothing was held"),
+        );
+        assert_eq!(outcome, ModifierWait::NotHeld);
+        assert_eq!(*calls.lock().unwrap(), 1, "one probe, no poll");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "no sleep when nothing is held"
+        );
+    }
+
+    #[test]
+    fn modifier_wait_polls_until_release() {
+        let (calls, probe) = scripted_probe(3);
+        let outcome = wait_for_modifier_release(
+            probe,
+            Some(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_millis(1),
+            || false,
+            || {},
+        );
+        assert!(matches!(outcome, ModifierWait::Released(_)), "{outcome:?}");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            4,
+            "3 held readings, then 1 released"
+        );
+    }
+
+    #[test]
+    fn modifier_wait_settles_after_a_release() {
+        let (_calls, probe) = scripted_probe(1);
+        let start = std::time::Instant::now();
+        let outcome = wait_for_modifier_release(
+            probe,
+            Some(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_millis(1),
+            || false,
+            || {},
+        );
+        assert!(matches!(outcome, ModifierWait::Released(_)), "{outcome:?}");
+        assert!(
+            start.elapsed() >= MODIFIER_RELEASE_SETTLE,
+            "the compositor gets time to see the physical release"
+        );
+    }
+
+    #[test]
+    fn modifier_wait_gives_up_at_the_timeout() {
+        let (calls, probe) = scripted_probe(usize::MAX);
+        let timeout = std::time::Duration::from_millis(30);
+        let start = std::time::Instant::now();
+        let outcome = wait_for_modifier_release(
+            probe,
+            Some(timeout),
+            std::time::Duration::from_millis(5),
+            || false,
+            || {},
+        );
+        assert_eq!(outcome, ModifierWait::TimedOut);
+        assert!(start.elapsed() >= timeout);
+        assert!(*calls.lock().unwrap() > 1, "must have polled");
+    }
+
+    #[test]
+    fn modifier_probe_runs_before_any_keystroke() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+        let keyboard = MockKeyboard::default();
+        let events = Arc::clone(&keyboard.events);
+
+        // Held for two readings: the keystroke must wait out both.
+        let probe_events = Arc::clone(&events);
+        let mut readings = 0;
+        let probe = move || {
+            probe_events.lock().unwrap().push("probe");
+            readings += 1;
+            readings <= 2
+        };
+
+        let mut result = None;
+        with_modifier_probe(probe, || {
+            result = Some(inject(
+                keyboard,
+                Arc::clone(&clipboard),
+                "hello world",
+                /* paste = */ false,
+                /* clipboard_fallback = */ false,
+                /* clipboard_only = */ false,
+            ));
+        });
+
+        assert!(result.unwrap().is_ok());
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["probe", "probe", "probe", "type"],
+            "every probe reading precedes the first keystroke"
+        );
+    }
+
+    #[test]
+    fn clipboard_only_never_checks_modifiers() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+        let (calls, probe) = scripted_probe(0);
+
+        let mut result = None;
+        with_modifier_probe(probe, || {
+            result = Some(inject(
+                MockKeyboard::default(),
+                Arc::clone(&clipboard),
+                "hello world",
+                /* paste = */ true,
+                /* clipboard_fallback = */ false,
+                /* clipboard_only = */ true,
+            ));
+        });
+
+        assert!(result.unwrap().is_ok());
+        assert_eq!(*calls.lock().unwrap(), 0, "no keystroke, so no wait");
+    }
+
+    /// Run `f` with a probe that reports "held" on every reading, counting
+    /// the readings.
+    fn with_modifier_held_forever(f: impl FnOnce()) -> usize {
+        let (calls, probe) = scripted_probe(usize::MAX);
+        with_modifier_probe(probe, f);
+        let n = *calls.lock().unwrap();
+        n
+    }
+
+    #[test]
+    fn zero_modifier_wait_probes_once_and_copies_when_held() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+        let keyboard = MockKeyboard::default();
+        let events = Arc::clone(&keyboard.events);
+
+        let mut result = None;
+        let probes = with_modifier_held_forever(|| {
+            result = Some(inject_with_keys(
+                test_keys_waiting(std::time::Duration::ZERO),
+                keyboard,
+                Arc::clone(&clipboard),
+                "hello world",
+                /* paste = */ false,
+                /* clipboard_fallback = */ false,
+                /* clipboard_only = */ false,
+            ));
+        });
+
+        assert_eq!(result.unwrap().unwrap(), Injection::CopiedForHeldModifier);
+        assert_eq!(probes, 1, "modifier_wait_ms = 0 reads once, no polling");
+        assert!(events.lock().unwrap().is_empty(), "no keystroke at all");
+        assert_eq!(clipboard.writes(), vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn zero_modifier_wait_types_when_nothing_is_held() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+        let keyboard = MockKeyboard::default();
+        let typed = Arc::clone(&keyboard.typed);
+        let (calls, probe) = scripted_probe(0);
+
+        let mut result = None;
+        with_modifier_probe(probe, || {
+            result = Some(inject_with_keys(
+                test_keys_waiting(std::time::Duration::ZERO),
+                keyboard,
+                Arc::clone(&clipboard),
+                "hello world",
+                /* paste = */ false,
+                /* clipboard_fallback = */ false,
+                /* clipboard_only = */ false,
+            ));
+        });
+
+        assert_eq!(result.unwrap().unwrap(), Injection::Delivered);
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert_eq!(*typed.lock().unwrap(), vec!["hello world".to_string()]);
+        assert!(clipboard.writes().is_empty());
+    }
+
+    #[test]
+    fn held_modifier_copies_instead_of_typing() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Typing mode never reads the clipboard (empty script panics on a
+        // read). With the fallback on too, the text is still written once.
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+        let keyboard = MockKeyboard::default();
+        let events = Arc::clone(&keyboard.events);
+
+        let mut result = None;
+        let probes = with_modifier_held_forever(|| {
+            result = Some(inject(
+                keyboard,
+                Arc::clone(&clipboard),
+                "hello world",
+                /* paste = */ false,
+                /* clipboard_fallback = */ true,
+                /* clipboard_only = */ false,
+            ));
+        });
+
+        assert_eq!(result.unwrap().unwrap(), Injection::CopiedForHeldModifier);
+        assert!(probes > 1, "must have polled until the cap");
+        assert!(events.lock().unwrap().is_empty(), "no keystroke at all");
+        assert_eq!(clipboard.writes(), vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn held_modifier_leaves_the_paste_text_in_the_clipboard() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Scripted so that a restore, if one ran, would write "original"
+        // back: the read-back would see the pasted text.
+        let clipboard = Arc::new(ScriptedClipboard::new(&[
+            Some("original"),
+            Some("hello world"),
+        ]));
+        let keyboard = MockKeyboard::default();
+        let events = Arc::clone(&keyboard.events);
+
+        let mut result = None;
+        with_modifier_held_forever(|| {
+            result = Some(inject(
+                keyboard,
+                Arc::clone(&clipboard),
+                "hello world",
+                /* paste = */ true,
+                /* clipboard_fallback = */ false,
+                /* clipboard_only = */ false,
+            ));
+        });
+
+        assert_eq!(result.unwrap().unwrap(), Injection::CopiedForHeldModifier);
+        assert!(events.lock().unwrap().is_empty(), "no Ctrl+V");
+        assert_eq!(
+            clipboard.writes(),
+            vec!["hello world".to_string()],
+            "the text stays; the previous clipboard is not restored"
+        );
+    }
+
+    #[test]
+    fn held_modifier_with_unreadable_clipboard_still_copies() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Paste mode, non-text clipboard: the path falls back to typing, and
+        // a held modifier then withholds that too. The text is copied rather
+        // than lost.
+        let clipboard = Arc::new(ScriptedClipboard::new(&[None]));
+        let keyboard = MockKeyboard::default();
+        let events = Arc::clone(&keyboard.events);
+
+        let mut result = None;
+        with_modifier_held_forever(|| {
+            result = Some(inject(
+                keyboard,
+                Arc::clone(&clipboard),
+                "hello world",
+                /* paste = */ true,
+                /* clipboard_fallback = */ false,
+                /* clipboard_only = */ false,
+            ));
+        });
+
+        assert_eq!(result.unwrap().unwrap(), Injection::CopiedForHeldModifier);
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(clipboard.writes(), vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn held_modifier_copy_failure_is_an_error() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut clipboard = ScriptedClipboard::new(&[]);
+        clipboard.fail_writes = true;
+        let clipboard = Arc::new(clipboard);
+
+        let mut result = None;
+        with_modifier_held_forever(|| {
+            result = Some(inject(
+                MockKeyboard::default(),
+                Arc::clone(&clipboard),
+                "hello world",
+                /* paste = */ false,
+                /* clipboard_fallback = */ false,
+                /* clipboard_only = */ false,
+            ));
+        });
+
+        assert!(
+            result.unwrap().is_err(),
+            "the copy was the only delivery; its failure must surface"
+        );
+    }
+
+    #[test]
+    fn uncapped_modifier_wait_ends_only_on_release_or_cancel() {
+        // Held for far longer than any batch cap would allow: still waits.
+        let (calls, probe) = scripted_probe(200);
+        let outcome =
+            wait_for_modifier_release(probe, None, std::time::Duration::ZERO, || false, || {});
+        assert!(matches!(outcome, ModifierWait::Released(_)), "{outcome:?}");
+        assert_eq!(*calls.lock().unwrap(), 201);
+
+        // Held forever: only the cancel check ends it.
+        let (_calls, probe) = scripted_probe(usize::MAX);
+        let mut checks = 0;
+        let outcome = wait_for_modifier_release(
+            probe,
+            None,
+            std::time::Duration::ZERO,
+            || {
+                checks += 1;
+                checks > 50
+            },
+            || {},
+        );
+        assert_eq!(outcome, ModifierWait::Cancelled);
+    }
+
+    /// Streaming waits out a held modifier however long it takes (here far
+    /// past both the 200 ms test cap and a zero cap), then types. There is
+    /// no clipboard path at all: `deliver_streaming_delta` takes none.
+    #[test]
+    fn streaming_delta_waits_for_release_past_any_cap_then_types() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for cap in [
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(200),
+        ] {
+            let keyboard = MockKeyboard::default();
+            let typed = Arc::clone(&keyboard.typed);
+            // 30 held polls at 15 ms: ~450 ms, more than twice the cap.
+            let (calls, probe) = scripted_probe(30);
+            let cancel = AtomicBool::new(false);
+            let tracker = ModifierWaitTracker::default();
+
+            let mut delivery = None;
+            let start = std::time::Instant::now();
+            with_keyboard(keyboard, || {
+                with_modifier_probe(probe, || {
+                    delivery = Some(
+                        deliver_streaming_delta("hello", test_keys_waiting(cap), &cancel, &tracker)
+                            .unwrap(),
+                    );
+                });
+            });
+
+            assert_eq!(delivery, Some(StreamingDelivery::Typed), "cap {cap:?}");
+            assert!(start.elapsed() > std::time::Duration::from_millis(400));
+            assert_eq!(*calls.lock().unwrap(), 31, "polled until the release");
+            assert_eq!(*typed.lock().unwrap(), vec!["hello".to_string()]);
+            assert!(
+                tracker
+                    .drain_deadline(start, std::time::Duration::ZERO)
+                    .is_some_and(|deadline| deadline > start),
+                "the finished wait was recorded"
+            );
+        }
+    }
+
+    /// `whisrs cancel` during the wait: the delta is discarded, nothing typed.
+    #[test]
+    fn cancel_aborts_a_streaming_delta_waiting_on_a_modifier() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let keyboard = MockKeyboard::default();
+        let events = Arc::clone(&keyboard.events);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tracker = ModifierWaitTracker::default();
+
+        // Held forever; the "user" cancels on the 10th reading.
+        let probe_cancel = Arc::clone(&cancel);
+        let mut readings = 0;
+        let probe = move || {
+            readings += 1;
+            if readings == 10 {
+                probe_cancel.store(true, Ordering::SeqCst);
+            }
+            true
+        };
+
+        let mut delivery = None;
+        with_keyboard(keyboard, || {
+            with_modifier_probe(probe, || {
+                delivery = Some(
+                    deliver_streaming_delta("secret", test_keys(), &cancel, &tracker).unwrap(),
+                );
+            });
+        });
+
+        assert_eq!(delivery, Some(StreamingDelivery::Cancelled));
+        assert!(events.lock().unwrap().is_empty(), "nothing typed");
+    }
+
+    /// Deltas that arrive while one waits on a held modifier queue in the
+    /// batcher and are typed in order once it is released.
+    #[test]
+    fn streaming_deltas_queued_during_a_modifier_wait_are_typed_in_order() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let keyboard = MockKeyboard::default();
+        let typed = Arc::clone(&keyboard.typed);
+        let (text_tx, text_rx) = tokio::sync::mpsc::channel::<String>(64);
+        text_tx.try_send("one".to_string()).unwrap();
+
+        // Held for the first 6 readings; the backend delivers two more
+        // deltas mid-wait, then closes its end of the channel.
+        let mut probe_tx = Some(text_tx);
+        let mut readings = 0;
+        let probe = move || {
+            readings += 1;
+            if readings == 2 {
+                if let Some(tx) = &probe_tx {
+                    tx.try_send(" two".to_string()).unwrap();
+                }
+            }
+            if readings == 3 {
+                if let Some(tx) = probe_tx.take() {
+                    tx.try_send(" three".to_string()).unwrap();
+                }
+            }
+            readings <= 6
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tracker = ModifierWaitTracker::default();
+        let mut full_text = String::new();
+        with_keyboard(keyboard, || {
+            with_modifier_probe(probe, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap();
+                full_text = runtime.block_on(crate::pipeline::run_typing_batcher(
+                    text_rx,
+                    Arc::clone(&cancel),
+                    None,
+                    |text| {
+                        // Same thread as the probe: deliver synchronously.
+                        let delivery =
+                            deliver_streaming_delta(&text, test_keys(), &cancel, &tracker).unwrap();
+                        assert_eq!(delivery, StreamingDelivery::Typed);
+                        async {}
+                    },
+                ));
+            });
+        });
+
+        assert_eq!(
+            *typed.lock().unwrap(),
+            vec!["one".to_string(), " two three".to_string()]
+        );
+        assert_eq!(full_text, "one two three");
+    }
+
+    #[test]
+    fn drain_deadline_pauses_while_a_delta_waits_on_a_modifier() {
+        let budget = std::time::Duration::from_secs(5);
+        let tracker = ModifierWaitTracker::default();
+        let drain_start = std::time::Instant::now();
+        assert_eq!(
+            tracker.drain_deadline(drain_start, budget),
+            Some(drain_start + budget),
+            "no wait yet: the plain budget"
+        );
+
+        tracker.begin();
+        assert_eq!(tracker.drain_deadline(drain_start, budget), None);
+
+        tracker.end();
+        let deadline = tracker.drain_deadline(drain_start, budget).unwrap();
+        assert!(
+            deadline >= drain_start + budget,
+            "the budget restarts at the release"
+        );
+    }
+
+    #[test]
+    fn command_mode_held_modifier_skips_clear_and_injection() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+        let keyboard = MockKeyboard::default();
+        let events = Arc::clone(&keyboard.events);
+
+        let mut result = None;
+        with_keyboard(keyboard, || {
+            with_modifier_held_forever(|| {
+                result = Some(clear_line_and_inject_with_clipboard(
+                    "git status",
+                    test_keys(),
+                    /* paste = */ false,
+                    /* clipboard_fallback = */ false,
+                    std::time::Duration::from_millis(5),
+                    Arc::clone(&clipboard) as Arc<dyn ClipboardBackend>,
+                ));
+            });
+        });
+
+        assert_eq!(result.unwrap().unwrap(), Injection::CopiedForHeldModifier);
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "no Ctrl+A/Ctrl+K and no typing"
+        );
+        assert_eq!(clipboard.writes(), vec!["git status".to_string()]);
+    }
+
+    #[test]
+    fn command_mode_clears_then_types_once_released() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let clipboard = Arc::new(ScriptedClipboard::new(&[]));
+        let keyboard = MockKeyboard::default();
+        let events = Arc::clone(&keyboard.events);
+        let typed = Arc::clone(&keyboard.typed);
+        let (_calls, probe) = scripted_probe(2);
+
+        let mut result = None;
+        with_keyboard(keyboard, || {
+            with_modifier_probe(probe, || {
+                result = Some(clear_line_and_inject_with_clipboard(
+                    "git status",
+                    test_keys(),
+                    /* paste = */ false,
+                    /* clipboard_fallback = */ false,
+                    std::time::Duration::from_millis(5),
+                    Arc::clone(&clipboard) as Arc<dyn ClipboardBackend>,
+                ));
+            });
+        });
+
+        assert_eq!(result.unwrap().unwrap(), Injection::Delivered);
+        assert_eq!(*events.lock().unwrap(), vec!["combo", "combo", "type"]);
+        assert_eq!(*typed.lock().unwrap(), vec!["git status".to_string()]);
+        assert!(clipboard.writes().is_empty());
+    }
+
+    /// The clear and the text share one modifier wait: a modifier pressed
+    /// after the clear's check cannot leave a cleared line with the rewrite
+    /// only in the clipboard. The probe is released on its first reading and
+    /// held on every later one, so a second wait would withhold the text.
+    #[test]
+    fn command_mode_clear_and_text_share_one_modifier_wait() {
+        let _lock = KEYBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for paste in [false, true] {
+            let clipboard = Arc::new(ScriptedClipboard::new(&[Some("original")]));
+            let keyboard = MockKeyboard::default();
+            let events = Arc::clone(&keyboard.events);
+            let calls = Arc::new(StdMutex::new(0));
+            let counter = Arc::clone(&calls);
+            let probe = move || {
+                let mut n = counter.lock().unwrap();
+                *n += 1;
+                *n > 1
+            };
+
+            let mut result = None;
+            with_keyboard(keyboard, || {
+                with_modifier_probe(probe, || {
+                    result = Some(clear_line_and_inject_with_clipboard(
+                        "git status",
+                        test_keys(),
+                        paste,
+                        /* clipboard_fallback = */ true,
+                        std::time::Duration::from_millis(5),
+                        Arc::clone(&clipboard) as Arc<dyn ClipboardBackend>,
+                    ));
+                });
+            });
+
+            assert!(result.unwrap().is_ok());
+            assert_eq!(*calls.lock().unwrap(), 1, "one wait (paste = {paste})");
+            let expected: Vec<&str> = if paste {
+                vec!["combo", "combo", "combo"]
+            } else {
+                vec!["combo", "combo", "type"]
+            };
+            assert_eq!(*events.lock().unwrap(), expected, "paste = {paste}");
+        }
     }
 }

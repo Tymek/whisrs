@@ -95,6 +95,24 @@ device = "default"
 # drops characters while whisrs is typing — e.g. Node/Ink-based apps like
 # Claude Code in raw mode. Default: 2.
 key_delay_ms = 2
+# How long to wait, in milliseconds, for physically held modifier keys (Super,
+# Alt, Ctrl, Shift) to be released before whisrs sends a keystroke with a
+# batch backend (groq, openai, deepgram, local-whisper, asr-sidecar) or in
+# command mode: typing, the paste shortcut, command mode's line clear and the
+# selection copy. A key typed while a modifier is held becomes a shortcut, so
+# stopping a dictation with Super+W and keeping Super down would otherwise
+# fire Super+<letter> compositor binds. whisrs never types while a modifier
+# is held: if one is still down when this runs out, the text is copied to the
+# clipboard instead and a warning is logged (paste it with Ctrl+V). In command
+# mode at a terminal the line is then not cleared either. 0 = don't wait: if
+# a modifier is held, the text goes straight to the clipboard.
+# Streaming backends (deepgram-streaming, openai-realtime,
+# openai-compatible-realtime) ignore this setting: they always wait for the
+# release, however long it takes, and then type the waiting text in order.
+# `whisrs cancel` ends that wait and discards the text.
+# The check reads /dev/input; when it can't, it can't see held keys and keys
+# are sent as before. Default: 10000.
+modifier_wait_ms = 10000
 # Inject text by clipboard paste (Ctrl+V) instead of typing keystrokes.
 # Default: false.
 #

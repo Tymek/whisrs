@@ -5,7 +5,9 @@ use tracing::{debug, warn};
 use xkb_type::ClipboardBackend;
 
 use crate::context::DaemonContext;
-use crate::injection::is_terminal_class;
+use crate::injection::{
+    is_terminal_class, wait_for_physical_modifier_release, KeystrokeOutcome, ModifierWait,
+};
 
 /// Delay before the simulated copy so briefly-held hotkey modifiers clear
 /// (see [`capture_selection`]).
@@ -51,6 +53,11 @@ pub(crate) enum CaptureError {
     /// an empty selection — see the type-level doc.
     #[error("no text selected — select some text first")]
     ClipboardUnchanged,
+    /// A physical modifier was still held after `[input] modifier_wait_ms`,
+    /// so the Ctrl+C was never sent (#154) and the clipboard is untouched.
+    /// Says nothing about the selection either way.
+    #[error("a modifier key was held, so the selection was not copied")]
+    ModifierHeld,
     /// The simulated Ctrl+C could not be sent (no uinput permission, ...).
     #[error("failed to copy selection: {0}")]
     CopyFailed(String),
@@ -62,11 +69,35 @@ pub(crate) enum CaptureError {
     ClipboardReadFailed(String),
 }
 
+/// Wait out a still-held hotkey modifier (e.g. Super from the speak or
+/// command bind) so the copy is not Super+Ctrl+C (#154). Called before the
+/// uinput device exists, so the probe never reads our own pressed Ctrl.
+/// `false` means a modifier was still held at `modifier_wait`: send nothing.
+fn modifiers_released(modifier_wait: Duration) -> bool {
+    if wait_for_physical_modifier_release(modifier_wait) == ModifierWait::TimedOut {
+        warn!(
+            "a modifier key was still held after {} ms; skipped the selection copy",
+            modifier_wait.as_millis()
+        );
+        return false;
+    }
+    true
+}
+
 /// Simulate a key combo (e.g. Ctrl+C, Ctrl+V) via a temporary uinput device.
-fn simulate_key_combo(modifier: evdev::Key, key: evdev::Key) -> anyhow::Result<()> {
+/// Sends nothing while a physical modifier is held (#154).
+fn simulate_key_combo(
+    modifier: evdev::Key,
+    key: evdev::Key,
+    modifier_wait: Duration,
+) -> anyhow::Result<KeystrokeOutcome> {
     use evdev::{AttributeSet, EventType, InputEvent, Key};
     use std::thread;
     use std::time::Duration;
+
+    if !modifiers_released(modifier_wait) {
+        return Ok(KeystrokeOutcome::ModifierHeld);
+    }
 
     let mut keys = AttributeSet::<Key>::new();
     keys.insert(modifier);
@@ -95,18 +126,24 @@ fn simulate_key_combo(modifier: evdev::Key, key: evdev::Key) -> anyhow::Result<(
     device.emit(&[InputEvent::new(EventType::KEY, modifier.code(), 0)])?;
     thread::sleep(Duration::from_millis(2));
 
-    Ok(())
+    Ok(KeystrokeOutcome::Sent)
 }
 
-/// Simulate a two-modifier + key combo (e.g. Ctrl+Shift+V) via a temporary uinput device.
+/// Simulate a two-modifier + key combo (e.g. Ctrl+Shift+V) via a temporary
+/// uinput device. Sends nothing while a physical modifier is held (#154).
 fn simulate_key_combo_2mod(
     mod1: evdev::Key,
     mod2: evdev::Key,
     key: evdev::Key,
-) -> anyhow::Result<()> {
+    modifier_wait: Duration,
+) -> anyhow::Result<KeystrokeOutcome> {
     use evdev::{AttributeSet, EventType, InputEvent, Key};
     use std::thread;
     use std::time::Duration;
+
+    if !modifiers_released(modifier_wait) {
+        return Ok(KeystrokeOutcome::ModifierHeld);
+    }
 
     let mut keys = AttributeSet::<Key>::new();
     keys.insert(mod1);
@@ -136,20 +173,21 @@ fn simulate_key_combo_2mod(
     device.emit(&[InputEvent::new(EventType::KEY, mod1.code(), 0)])?;
     thread::sleep(Duration::from_millis(2));
 
-    Ok(())
+    Ok(KeystrokeOutcome::Sent)
 }
 
 /// Simulate Ctrl+C (copy) via uinput.
-fn simulate_copy() -> anyhow::Result<()> {
-    simulate_key_combo(evdev::Key::KEY_LEFTCTRL, evdev::Key::KEY_C)
+fn simulate_copy(modifier_wait: Duration) -> anyhow::Result<KeystrokeOutcome> {
+    simulate_key_combo(evdev::Key::KEY_LEFTCTRL, evdev::Key::KEY_C, modifier_wait)
 }
 
 /// Simulate Ctrl+Shift+C (terminal copy) via uinput.
-fn simulate_terminal_copy() -> anyhow::Result<()> {
+fn simulate_terminal_copy(modifier_wait: Duration) -> anyhow::Result<KeystrokeOutcome> {
     simulate_key_combo_2mod(
         evdev::Key::KEY_LEFTCTRL,
         evdev::Key::KEY_LEFTSHIFT,
         evdev::Key::KEY_C,
+        modifier_wait,
     )
 }
 
@@ -227,15 +265,16 @@ pub(crate) async fn capture_selection(context: &DaemonContext) -> Result<String,
     // primary-selection fast path never queries the window tracker.
     let tracker = context.window_tracker.clone();
     let user_terminal_classes = context.config.input.terminal_classes.clone();
+    let modifier_wait = Duration::from_millis(context.config.input.modifier_wait_ms);
     let copy = move || {
         let is_terminal = tracker
             .get_focused_window_class()
             .map(|c| is_terminal_class(&c, &user_terminal_classes))
             .unwrap_or(false);
         if is_terminal {
-            simulate_terminal_copy()
+            simulate_terminal_copy(modifier_wait)
         } else {
-            simulate_copy()
+            simulate_copy(modifier_wait)
         }
     };
 
@@ -253,7 +292,7 @@ async fn capture_selection_impl<F>(
     read_delay: Duration,
 ) -> Result<String, CaptureError>
 where
-    F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+    F: FnOnce() -> anyhow::Result<KeystrokeOutcome> + Send + 'static,
 {
     // Trust a non-empty primary selection directly — no copy, no equality
     // check, and no clipboard write of any kind.
@@ -279,7 +318,12 @@ where
     tokio::time::sleep(settle_delay).await;
 
     match tokio::task::spawn_blocking(copy).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(KeystrokeOutcome::Sent)) => {}
+        // A held modifier withheld the Ctrl+C (#154). Returned straight
+        // away with its own variant, so the user learns why: reading back a
+        // clipboard no copy touched would claim "no text selected"
+        // (`ClipboardUnchanged`, or `NothingSelected` on an empty one).
+        Ok(Ok(KeystrokeOutcome::ModifierHeld)) => return Err(CaptureError::ModifierHeld),
         Ok(Err(e)) => return Err(CaptureError::CopyFailed(e.to_string())),
         Err(e) => return Err(CaptureError::CopyTaskPanicked(e.to_string())),
     }
@@ -391,11 +435,59 @@ mod tests {
     }
 
     /// A copy simulation that only records whether it fired.
-    fn tracking_copy(fired: Arc<AtomicBool>) -> impl FnOnce() -> anyhow::Result<()> + Send {
+    fn tracking_copy(
+        fired: Arc<AtomicBool>,
+    ) -> impl FnOnce() -> anyhow::Result<KeystrokeOutcome> + Send {
         move || {
             fired.store(true, Ordering::SeqCst);
-            Ok(())
+            Ok(KeystrokeOutcome::Sent)
         }
+    }
+
+    #[tokio::test]
+    async fn held_modifier_skips_the_copy_and_says_so() {
+        // The copy reports a held modifier (#154): nothing was sent, so the
+        // capture stops there with its own error. The clipboard is empty, so
+        // a read-back would have said `NothingSelected`, a claim about the
+        // user nobody checked. Nothing is written.
+        let clipboard = ScriptedClipboard::new("", &[Some("")]);
+
+        let result = capture_selection_impl(
+            &clipboard,
+            || Ok(KeystrokeOutcome::ModifierHeld),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(result, Err(CaptureError::ModifierHeld));
+        assert!(
+            clipboard.writes().is_empty(),
+            "clipboard must stay untouched"
+        );
+    }
+
+    #[test]
+    fn simulated_copy_sends_nothing_while_a_modifier_is_held() {
+        // A probe that never releases, and a tiny cap: the copy must give up
+        // before it builds a uinput device or emits a key. Reaching the
+        // device would fail here (or, worse, press Ctrl+C) instead of
+        // returning `ModifierHeld`.
+        let mut outcomes = Vec::new();
+        crate::injection::with_modifier_probe(
+            || true,
+            || {
+                outcomes.push(simulate_copy(Duration::from_millis(20)).unwrap());
+                outcomes.push(simulate_terminal_copy(Duration::from_millis(20)).unwrap());
+            },
+        );
+        assert_eq!(
+            outcomes,
+            vec![
+                KeystrokeOutcome::ModifierHeld,
+                KeystrokeOutcome::ModifierHeld
+            ]
+        );
     }
 
     #[tokio::test]
@@ -617,6 +709,10 @@ mod tests {
         assert_eq!(
             CaptureError::ClipboardUnchanged.to_string(),
             "no text selected — select some text first"
+        );
+        assert_eq!(
+            CaptureError::ModifierHeld.to_string(),
+            "a modifier key was held, so the selection was not copied"
         );
         assert_eq!(
             CaptureError::CopyFailed("uinput unavailable".to_string()).to_string(),

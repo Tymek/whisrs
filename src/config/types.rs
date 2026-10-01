@@ -312,6 +312,29 @@ pub struct InputConfig {
     /// Node/Ink-based apps like Claude Code).
     #[serde(default = "default_key_delay_ms")]
     pub key_delay_ms: u64,
+    /// How long to wait, in milliseconds, for physically held modifier keys
+    /// (Super, Alt, Ctrl, Shift) to be released before sending a synthetic
+    /// keystroke with a batch backend or in command mode (typing, paste,
+    /// line clear, selection copy). Default 10000.
+    ///
+    /// A keystroke sent while a modifier is held becomes a shortcut: stopping
+    /// a dictation with `Super+W` and keeping Super down would otherwise turn
+    /// the typed text into `Super+<letter>` compositor binds (#154). whisrs
+    /// never types while a modifier is held. If one is still down when this
+    /// cap runs out, the text is copied to the clipboard instead of typed,
+    /// and a warning is logged.
+    ///
+    /// Streaming backends ignore this cap: each delta waits for the release
+    /// however long it takes, later deltas queue behind it and are typed in
+    /// order, and nothing goes to the clipboard. `whisrs cancel` ends the
+    /// wait and discards the waiting text.
+    ///
+    /// `0` means don't wait: if a modifier is held, the text goes straight
+    /// to the clipboard; otherwise it is typed at once. When `/dev/input`
+    /// cannot be read, the check cannot see held keys and keys are sent as
+    /// before.
+    #[serde(default = "default_modifier_wait_ms")]
+    pub modifier_wait_ms: u64,
     /// Keyboard-injection backend. `auto` (the recommended default) prefers
     /// the Wayland virtual keyboard when available and otherwise falls back
     /// to uinput. Set this to `wayland-vk` to fix garbled bilingual /
@@ -419,6 +442,7 @@ impl Default for InputConfig {
     fn default() -> Self {
         Self {
             key_delay_ms: default_key_delay_ms(),
+            modifier_wait_ms: default_modifier_wait_ms(),
             backend: InjectorBackend::default(),
             paste: false,
             clipboard_fallback: false,
@@ -650,6 +674,9 @@ fn default_llm_instruction() -> String {
 }
 fn default_key_delay_ms() -> u64 {
     2
+}
+fn default_modifier_wait_ms() -> u64 {
+    10_000
 }
 /// The `[deepgram] model` a config gets when the section omits it.
 ///
@@ -3274,6 +3301,31 @@ mod tests {
             );
             assert_no_stub_backend_advice(&warning.message);
         }
+    }
+
+    #[test]
+    fn modifier_wait_defaults_to_ten_seconds() {
+        assert_eq!(InputConfig::default().modifier_wait_ms, 10_000);
+        let parsed: InputConfig = toml::from_str("key_delay_ms = 2\n").unwrap();
+        assert_eq!(
+            parsed.modifier_wait_ms, 10_000,
+            "an absent key gets the default"
+        );
+    }
+
+    #[test]
+    fn modifier_wait_round_trips_and_is_a_known_key() {
+        let input = InputConfig {
+            modifier_wait_ms: 0,
+            ..Default::default()
+        };
+        let text = toml::to_string(&input).unwrap();
+        let back: InputConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.modifier_wait_ms, 0);
+        assert!(
+            unknown_config_keys("[input]\nmodifier_wait_ms = 2500\n").is_empty(),
+            "modifier_wait_ms must not trip the unknown-key warning"
+        );
     }
 
     /// Build a groq (non-streaming, so no paste/streaming warning of its own)

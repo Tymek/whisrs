@@ -91,6 +91,30 @@ impl DaemonState {
         }
     }
 
+    /// End a streaming session's claim on `streaming_cancel`: clear the slot
+    /// only if it still holds `flag`, so a newer session's flag survives.
+    /// Called by whichever side sees the session end first (the pipeline's
+    /// tail, or `handle_toggle` once the pipeline task has been awaited,
+    /// which also covers an early error or panic). After it, `cancel` can no
+    /// longer reach this session.
+    pub(crate) fn release_streaming_cancel(&mut self, flag: &Arc<AtomicBool>) {
+        if self
+            .streaming_cancel
+            .as_ref()
+            .is_some_and(|f| Arc::ptr_eq(f, flag))
+        {
+            self.streaming_cancel = None;
+        }
+    }
+
+    /// A stopped streaming session is still draining its last deltas (#154).
+    /// `streaming_cancel` is `Some` only from a streaming session's start
+    /// until it ends (see `release_streaming_cancel`), and command mode never
+    /// installs one, so this cannot match a command-mode `Transcribing`.
+    pub(crate) fn streaming_session_draining(&self) -> bool {
+        self.state_machine.state() == State::Transcribing && self.streaming_cancel.is_some()
+    }
+
     /// Consume the active session's language, falling back to the config
     /// default. Taking (not reading) the value is what ends the language
     /// session — a per-toggle override applies to exactly one recording.
