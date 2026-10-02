@@ -467,7 +467,7 @@ class the built-in list misses to `[input] terminal_classes`.
 
 - `"default"` (or empty): the system default input, through ALSA. With the PipeWire or PulseAudio ALSA plugin installed (the usual setup) this follows the default source set in your sound settings.
 - A PulseAudio or PipeWire source name, such as `alsa_input.usb-Blue_Microphones_Yeti-00.analog-stereo`. List them with `pactl list short sources` (second column), or pick one from `whisrs config` under the audio device item. The source description shown in your sound settings also works. Monitor sources (names ending in `.monitor`) record what your speakers play.
-- An ALSA PCM name, such as `pipewire` or `sysdefault:CARD=PCH` (see `arecord -L`), for systems without a PulseAudio or PipeWire server.
+- An ALSA PCM name, such as `pipewire`, `plughw:1,0` or `sysdefault:CARD=PCH` (see `arecord -L`). This also covers systems without a PulseAudio or PipeWire server.
 
 PulseAudio/PipeWire sources are checked first, then ALSA names. A name that matches nothing logs a warning listing the valid names and falls back to the system default. The daemon reads the device when it starts, so restart it after a change (`whisrs restart`); its startup log shows which device the name resolved to. Audio cues and read-aloud playback always use the default output device.
 
