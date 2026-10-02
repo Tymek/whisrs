@@ -962,22 +962,21 @@ pub(crate) fn select_language(existing: Option<&Config>) -> Result<String> {
 
 /// Attempt to open the default audio input device and report success/failure.
 fn test_microphone() {
-    use cpal::traits::{DeviceTrait, HostTrait};
+    use cpal::traits::DeviceTrait;
 
     println!("\n{BOLD}Testing microphone...{RESET}");
 
-    let host = cpal::default_host();
-    match host.default_input_device() {
-        Some(device) => {
-            let name = device.name().unwrap_or_else(|_| "unknown".into());
-            println!("  {GREEN}Microphone OK:{RESET} {name}");
+    match crate::audio::device::resolve_input("default") {
+        Ok(resolved) => {
+            let device = resolved.device;
+            println!("  {GREEN}Microphone OK:{RESET} {device}");
 
             // Try to get a supported config to verify the device actually works.
             match device.default_input_config() {
                 Ok(config) => {
                     println!(
                         "  {DIM}Format: {} Hz, {} channel(s){RESET}",
-                        config.sample_rate().0,
+                        config.sample_rate(),
                         config.channels()
                     );
                 }
@@ -986,26 +985,21 @@ fn test_microphone() {
                 }
             }
         }
-        None => {
+        Err(_) => {
             println!("  {RED}No default audio input device found.{RESET}");
 
-            // List available devices.
-            if let Ok(devices) = host.input_devices() {
-                let names: Vec<String> = devices.filter_map(|d| d.name().ok()).collect();
-                if names.is_empty() {
-                    println!(
-                        "  No input devices detected. Check that your microphone is connected"
-                    );
-                    println!("  and that PipeWire/PulseAudio is running.");
-                } else {
-                    println!("  Available input devices:");
-                    for name in &names {
-                        println!("    - {name}");
-                    }
-                    println!(
-                        "  {DIM}Set the device in config.toml under [audio] device = \"...\"{RESET}"
-                    );
+            let devices = crate::audio::device::list_input_devices();
+            if devices.is_empty() {
+                println!("  No input devices detected. Check that your microphone is connected");
+                println!("  and that PipeWire/PulseAudio is running.");
+            } else {
+                println!("  Available input devices:");
+                for d in &devices {
+                    println!("    - {} ({})", d.id, d.description);
                 }
+                println!(
+                    "  {DIM}Set the device in config.toml under [audio] device = \"...\"{RESET}"
+                );
             }
         }
     }

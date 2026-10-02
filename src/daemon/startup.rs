@@ -274,23 +274,29 @@ pub(crate) fn check_uinput_access() {
     }
 }
 
-pub(crate) fn check_audio_devices() {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    let host = cpal::default_host();
-    match host.default_input_device() {
-        Some(device) => {
-            let name = device.name().unwrap_or_else(|_| "unknown".into());
-            info!("default audio input device: {name}");
+/// Log what `[audio] device` resolves to. Diagnostic only: it can run before
+/// the sound server is up, so it must not start the PulseAudio backoff or
+/// mark an unknown name as warned for the first recording.
+pub(crate) fn check_audio_devices(device: &str) {
+    match whisrs::audio::device::resolve_input_for_diagnostics(device) {
+        Ok(resolved) => {
+            info!(
+                "audio input: [audio] device = \"{device}\" resolved to {} ({})",
+                resolved.device, resolved.source
+            );
         }
-        None => {
-            warn!("no default audio input device found");
-            if let Ok(devices) = host.input_devices() {
-                let names: Vec<String> = devices.filter_map(|d| d.name().ok()).collect();
-                if names.is_empty() {
-                    warn!("no audio input devices available at all");
-                } else {
-                    warn!("available audio input devices: {}", names.join(", "));
-                }
+        Err(e) => {
+            warn!("{e}");
+            let names: Vec<String> = whisrs::audio::block_off_runtime(|| {
+                whisrs::audio::device::list_input_devices_for(device)
+            })
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+            if names.is_empty() {
+                warn!("no audio input devices available at all");
+            } else {
+                warn!("available audio input devices: {}", names.join(", "));
             }
         }
     }

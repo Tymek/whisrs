@@ -88,7 +88,7 @@ height = 40                 # 36..=48 (clamped)
 # glow         = "#F0EDF5"
 
 [audio]
-device = "default"
+device = "default"         # input device; see "Choosing the microphone" below
 
 [input]
 # Inter-key delay for the virtual keyboard (uinput). Raise this if a TUI
@@ -460,6 +460,16 @@ Terminal detection needs the compositor to report the focused window class,
 which today means Hyprland, Niri, Sway and X11. On KDE and GNOME a terminal is
 treated as an ordinary target, so a multi-line reply is typed there. Add any
 class the built-in list misses to `[input] terminal_classes`.
+
+## Choosing the microphone
+
+`[audio] device` picks the input whisrs records from:
+
+- `"default"` (or empty): the system default input, through ALSA. With the PipeWire or PulseAudio ALSA plugin installed (the usual setup) this follows the default source set in your sound settings.
+- A PulseAudio or PipeWire source name, such as `alsa_input.usb-Blue_Microphones_Yeti-00.analog-stereo`. List them with `pactl list short sources` (second column), or pick one from `whisrs config` under the audio device item. The source description shown in your sound settings also works. Monitor sources (names ending in `.monitor`) record what your speakers play.
+- An ALSA PCM name, such as `pipewire`, `plughw:1,0` or `sysdefault:CARD=PCH` (see `arecord -L`). This also covers systems without a PulseAudio or PipeWire server.
+
+PulseAudio/PipeWire sources are checked first, then ALSA names. A name that matches nothing logs a warning listing the valid names and falls back to the system default. The daemon reads the device when it starts, so restart it after a change (`whisrs restart`); its startup log shows which device the name resolved to. Audio cues and read-aloud playback always use the default output device.
 
 ## The vocabulary file
 
