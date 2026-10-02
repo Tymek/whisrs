@@ -447,33 +447,57 @@ fn edit_vocabulary_and_prompt(config: &mut Config, use_vocab_file: bool) -> Resu
 }
 
 fn edit_audio_device(config: &mut Config) -> Result<()> {
+    use crate::audio::device::{is_default_name, list_input_devices};
+
     println!("\n  {BOLD}Audio device{RESET}");
+    println!("  Current: {}", config.audio.device);
 
     let devices = list_input_devices();
     if devices.is_empty() {
         println!("  {YELLOW}No input devices detected.{RESET}");
-    } else {
-        println!("  {DIM}Detected input devices:{RESET}");
-        for d in &devices {
-            println!("    - {d}");
-        }
     }
 
-    let new_device: String = Input::new()
-        .with_prompt("Audio device name (\"default\" to use system default)")
-        .default(config.audio.device.clone())
-        .interact_text()
-        .context("failed to read audio device")?;
-    config.audio.device = new_device;
-    Ok(())
-}
+    let mut items = vec!["System default".to_string()];
+    items.extend(devices.iter().map(|d| {
+        let monitor = if d.is_monitor() {
+            " [system audio]"
+        } else {
+            ""
+        };
+        format!("{}  ({}){monitor}", d.description, d.id)
+    }));
+    items.push("Enter a name manually".to_string());
 
-fn list_input_devices() -> Vec<String> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    cpal::default_host()
-        .input_devices()
-        .map(|iter| iter.filter_map(|d| d.name().ok()).collect())
-        .unwrap_or_default()
+    let current = config.audio.device.trim();
+    let default = if is_default_name(current) {
+        0
+    } else {
+        devices
+            .iter()
+            .position(|d| d.id == current)
+            .map(|i| i + 1)
+            .unwrap_or(items.len() - 1)
+    };
+
+    let choice = Select::new()
+        .with_prompt("Input device (restart the daemon to apply)")
+        .items(&items)
+        .default(default)
+        .interact()
+        .context("failed to read audio device choice")?;
+
+    config.audio.device = if choice == 0 {
+        "default".to_string()
+    } else if let Some(d) = devices.get(choice - 1) {
+        d.id.clone()
+    } else {
+        Input::new()
+            .with_prompt("Audio device name (\"default\" to use system default)")
+            .default(config.audio.device.clone())
+            .interact_text()
+            .context("failed to read audio device")?
+    };
+    Ok(())
 }
 
 fn edit_key_delay(config: &mut Config) -> Result<()> {

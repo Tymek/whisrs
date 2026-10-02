@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleRate, StreamConfig};
+use cpal::StreamConfig;
 use tracing::{debug, warn};
 
 use crate::WhisrsError;
@@ -863,7 +863,7 @@ fn open_output(
     native_rate: u32,
     native_channels: u16,
 ) -> Result<(cpal::Device, StreamConfig), WhisrsError> {
-    let host = cpal::default_host();
+    let host = super::device::alsa_host().map_err(|e| WhisrsError::Audio(e.to_string()))?;
     let device = host
         .default_output_device()
         .ok_or_else(|| WhisrsError::Audio("no default audio output device".to_string()))?;
@@ -872,7 +872,7 @@ fn open_output(
     // to match. Forcing the clip's native format (e.g. Groq's 24 kHz mono) can
     // fail to build a stream on devices that only advertise their default rate.
     let (target_rate, target_channels) = match device.default_output_config() {
-        Ok(cfg) => (cfg.sample_rate().0, cfg.channels().max(1)),
+        Ok(cfg) => (cfg.sample_rate(), cfg.channels().max(1)),
         Err(e) => {
             debug!("no default output config ({e}); using clip's native format");
             (native_rate, native_channels.max(1))
@@ -881,7 +881,7 @@ fn open_output(
 
     let config = StreamConfig {
         channels: target_channels,
-        sample_rate: SampleRate(target_rate),
+        sample_rate: target_rate,
         buffer_size: cpal::BufferSize::Default,
     };
     Ok((device, config))
@@ -918,7 +918,7 @@ impl StreamPipeline {
         level_tx: Option<tokio::sync::watch::Sender<f32>>,
     ) -> Result<Self, WhisrsError> {
         let (device, config) = open_output(format.sample_rate, format.channels)?;
-        let samples_per_sec = config.sample_rate.0 as f64 * config.channels as f64;
+        let samples_per_sec = config.sample_rate as f64 * config.channels as f64;
         let queue: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
             (samples_per_sec * QUEUE_SECONDS) as usize,
         )));
@@ -927,7 +927,7 @@ impl StreamPipeline {
         let stop_cb = Arc::clone(stop);
         let stream = device
             .build_output_stream(
-                &config,
+                config,
                 move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                     if stop_cb.load(Ordering::Acquire) {
                         data.fill(0.0);
@@ -966,7 +966,7 @@ impl StreamPipeline {
                 format.channels,
                 format.sample_rate,
                 config.channels,
-                config.sample_rate.0,
+                config.sample_rate,
             ),
             queue,
             batch: ((samples_per_sec * ENQUEUE_BATCH_SECONDS) as usize).max(1),
@@ -1191,7 +1191,7 @@ fn play_decoded(
     }
 
     let (device, config) = open_output(decoded.sample_rate, decoded.channels)?;
-    let target_rate = config.sample_rate.0;
+    let target_rate = config.sample_rate;
     let target_channels = config.channels;
 
     let samples = resample_remap(
@@ -1214,7 +1214,7 @@ fn play_decoded(
     let level_tx_cb = level_tx.clone();
     let stream = device
         .build_output_stream(
-            &config,
+            config,
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                 if stop_cb.load(Ordering::Acquire) {
                     for sample in data.iter_mut() {

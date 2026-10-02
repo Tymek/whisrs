@@ -275,7 +275,7 @@ If the LLM call fails, times out, or returns nothing, the raw transcript is type
 | **X11 (any WM)** | Tested by community on Ubuntu 24.04 (Xorg) |
 | **GNOME Wayland** | Tested by community on Ubuntu 24.04 and Arch (mutter); overlay via the bundled [GNOME Shell extension](contrib/gnome-shell-extension/README.md) |
 | **KDE Wayland** | Implemented via D-Bus; reports welcome |
-| **Audio** | PipeWire, PulseAudio, ALSA (auto-detected via cpal) |
+| **Audio** | ALSA default input (follows the PipeWire/PulseAudio default source), or a specific PipeWire/PulseAudio source or ALSA device via `[audio] device` |
 | **Distros** | Confirmed on Arch Linux and Ubuntu 24.04; any Linux with the system dependencies above |
 
 > **Note:** whisrs is daily-driven on Hyprland (Arch Linux), with community confirmation on GNOME Wayland (Ubuntu 24.04 + Arch), Xorg (Ubuntu 24.04), and Niri (CachyOS). Sway, i3, and KDE reports are still wanted; if you use whisrs there, please open an issue with what works and what doesn't.

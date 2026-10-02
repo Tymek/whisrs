@@ -1067,23 +1067,22 @@ pub(crate) async fn process_recording_batch(
     Ok(outcome)
 }
 
-pub(crate) fn format_no_microphone_error() -> String {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    let host = cpal::default_host();
-    let mut msg = "No microphone found — no default audio input device available.".to_string();
-    if let Ok(devices) = host.input_devices() {
-        let names: Vec<String> = devices.filter_map(|d| d.name().ok()).collect();
-        if names.is_empty() {
-            msg.push_str("\nNo audio input devices detected. Check that your microphone is connected and PipeWire/PulseAudio is running.");
-        } else {
-            msg.push_str("\nAvailable input devices:");
-            for name in &names {
-                msg.push_str(&format!("\n  - {name}"));
-            }
-            msg.push_str(
-                "\nSet the device in ~/.config/whisrs/config.toml under [audio] device = \"...\"",
-            );
+/// `device` is the configured `[audio] device`: a stock `"default"` lists
+/// ALSA devices only, so this error path never opens a PulseAudio connection.
+pub(crate) fn format_no_microphone_error(device: &str) -> String {
+    let mut msg = "No microphone found: no default audio input device available.".to_string();
+    let devices =
+        whisrs::audio::block_off_runtime(|| whisrs::audio::device::list_input_devices_for(device));
+    if devices.is_empty() {
+        msg.push_str("\nNo audio input devices detected. Check that your microphone is connected and PipeWire/PulseAudio is running.");
+    } else {
+        msg.push_str("\nAvailable input devices:");
+        for d in &devices {
+            msg.push_str(&format!("\n  - {} ({})", d.id, d.description));
         }
+        msg.push_str(
+            "\nSet the device in ~/.config/whisrs/config.toml under [audio] device = \"...\"",
+        );
     }
     msg
 }

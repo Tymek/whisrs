@@ -1,11 +1,11 @@
 //! Audio feedback — play subtle tones on recording start, stop, and completion.
 //!
 //! Generates simple tones programmatically using `cpal` for playback on the
-//! default output device. Each play function spawns a thread so it never
+//! ALSA host's default output device. Each play function spawns a thread so it never
 //! blocks the caller.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, SampleRate, StreamConfig};
+use cpal::{SampleFormat, StreamConfig};
 use tracing::warn;
 
 /// Sample rate for generated tones.
@@ -101,7 +101,13 @@ fn generate_tone(freq_hz: f32, duration_secs: f32, volume: f32) -> Vec<f32> {
 
 /// Play f32 samples on the default output device (blocking until complete).
 fn play_samples(samples: &[f32]) {
-    let host = cpal::default_host();
+    let host = match super::device::alsa_host() {
+        Ok(host) => host,
+        Err(e) => {
+            warn!("{e}");
+            return;
+        }
+    };
     let device = match host.default_output_device() {
         Some(d) => d,
         None => {
@@ -112,7 +118,7 @@ fn play_samples(samples: &[f32]) {
 
     let config = StreamConfig {
         channels: 1,
-        sample_rate: SampleRate(TONE_SAMPLE_RATE),
+        sample_rate: TONE_SAMPLE_RATE,
         buffer_size: cpal::BufferSize::Default,
     };
 
@@ -123,8 +129,8 @@ fn play_samples(samples: &[f32]) {
         .map(|configs| {
             configs.into_iter().any(|c| {
                 c.channels() >= 1
-                    && c.min_sample_rate().0 <= TONE_SAMPLE_RATE
-                    && c.max_sample_rate().0 >= TONE_SAMPLE_RATE
+                    && c.min_sample_rate() <= TONE_SAMPLE_RATE
+                    && c.max_sample_rate() >= TONE_SAMPLE_RATE
                     && c.sample_format() == SampleFormat::F32
             })
         })
@@ -142,7 +148,7 @@ fn play_samples(samples: &[f32]) {
     let done_clone = std::sync::Arc::clone(&done);
 
     let stream = match device.build_output_stream(
-        &config,
+        config,
         move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
             for sample in data.iter_mut() {
                 let idx = sample_idx_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

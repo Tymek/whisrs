@@ -45,6 +45,20 @@ use crate::startup::{
 #[command(name = "whisrsd", about = "whisrs dictation daemon", version)]
 struct Args {}
 
+/// The pulseaudio crate logs every connection, and an ERROR on each normal
+/// disconnect, so it is silenced unless `RUST_LOG` names it.
+const DEFAULT_LOG_DIRECTIVES: &str = "info,pulseaudio=off";
+
+/// Log filter directives: `RUST_LOG` when set, with `pulseaudio=off` appended
+/// unless it already mentions `pulseaudio`.
+fn log_directives(rust_log: Option<&str>) -> String {
+    match rust_log.map(str::trim).filter(|v| !v.is_empty()) {
+        None => DEFAULT_LOG_DIRECTIVES.to_string(),
+        Some(v) if v.contains("pulseaudio") => v.to_string(),
+        Some(v) => format!("{v},pulseaudio=off"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Not dead code: this call is what makes the flags above exit.
@@ -52,18 +66,20 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_new(log_directives(
+                std::env::var("RUST_LOG").ok().as_deref(),
+            ))
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_DIRECTIVES)),
         )
         .init();
 
     info!("whisrsd v{} starting", env!("CARGO_PKG_VERSION"));
 
     check_uinput_access();
-    check_audio_devices();
 
     let (config, config_warning) = load_config();
     validate_config(&config);
+    check_audio_devices(&config.audio.device);
     let notify = config.general.notify;
 
     // Notify user if config parsing failed and defaults are being used.
@@ -317,6 +333,17 @@ mod tests {
     #[test]
     fn daemon_rejects_unknown_flags() {
         assert!(Args::try_parse_from(["whisrsd", "--nope"]).is_err());
+    }
+
+    #[test]
+    fn log_directives_silence_pulseaudio() {
+        assert_eq!(log_directives(None), "info,pulseaudio=off");
+        assert_eq!(log_directives(Some("  ")), "info,pulseaudio=off");
+        assert_eq!(log_directives(Some("debug")), "debug,pulseaudio=off");
+        assert_eq!(
+            log_directives(Some("whisrs=trace,pulseaudio=warn")),
+            "whisrs=trace,pulseaudio=warn"
+        );
     }
 
     /// `contrib/whisrs.service` runs `whisrsd` with no arguments, so a
